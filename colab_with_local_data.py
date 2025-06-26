@@ -3,17 +3,17 @@
 GPT-2 Training in Google Colab with Local WikiText Data
 """
 
-
-
 # ==================== IMPORTS ====================
 import os
 import sys
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math
 import pandas as pd
 from datasets import Dataset, DatasetDict
 from transformers import (
-    GPT2Config, GPT2LMHeadModel, AutoTokenizer,
+    AutoTokenizer,
     Trainer, TrainingArguments, DataCollatorForLanguageModeling
 )
 from tokenizers import Tokenizer
@@ -21,8 +21,206 @@ from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import Whitespace
 
-# ==================== DATA LOADING FUNCTIONS ====================
+# ==================== CUSTOM TRANSFORMER ARCHITECTURE ====================
 
+class CustomTransformerConfig:
+    """Configuration for custom GPT-2 model"""
+    def __init__(self, vocab_size=50257, n_positions=1024, n_embd=768, n_layer=12, n_head=12, n_inner=3072):
+        self.vocab_size = vocab_size
+        self.n_positions = n_positions  # max sequence length
+        self.n_embd = n_embd           # embedding dimension
+        self.n_layer = n_layer         # number of transformer layers
+        self.n_head = n_head           # number of attention heads
+        self.n_inner = n_inner         # feedforward inner dimension
+
+class MultiHeadMaskedSelfAttention(nn.Module):
+    """
+    (b) Multi-head masked self-attention layers with causal (unidirectional) attention
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.n_embd = config.n_embd
+        self.n_head = config.n_head
+        self.head_dim = config.n_embd // config.n_head
+        
+        assert config.n_embd % config.n_head == 0, "n_embd must be divisible by n_head"
+        
+        # Use PyTorch's MultiheadAttention as suggested
+        self.attention = nn.MultiheadAttention(
+            embed_dim=config.n_embd,
+            num_heads=config.n_head,
+            dropout=0.1,
+            batch_first=True  # Use batch_first for easier handling
+        )
+        
+        # Create causal mask
+        self.register_buffer("causal_mask", self._create_causal_mask(config.n_positions))
+    
+    def _create_causal_mask(self, seq_len):
+        """Create causal mask to prevent attending to future positions"""
+        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1)
+        return mask.bool()
+    
+    def forward(self, x):
+        batch_size, seq_len, _ = x.shape
+        
+        # Get causal mask for current sequence length
+        causal_mask = self.causal_mask[:seq_len, :seq_len]
+        
+        # Apply multi-head attention with causal mask
+        attn_output, _ = self.attention(
+            query=x,
+            key=x, 
+            value=x,
+            attn_mask=causal_mask,
+            need_weights=False
+        )
+        
+        return attn_output
+
+class FeedForward(nn.Module):
+    """
+    (c) Feedforward layers: Two linear layers with GELU non-linearity
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.linear1 = nn.Linear(config.n_embd, config.n_inner)
+        self.linear2 = nn.Linear(config.n_inner, config.n_embd)
+        self.gelu = nn.GELU()
+        self.dropout = nn.Dropout(0.1)
+    
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.gelu(x)
+        x = self.dropout(x)
+        x = self.linear2(x)
+        return x
+
+class TransformerBlock(nn.Module):
+    """
+    (d) Layer normalization and residual connections with pre-layer normalization
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(config.n_embd)  # Pre-attention layer norm
+        self.attention = MultiHeadMaskedSelfAttention(config)
+        self.ln2 = nn.LayerNorm(config.n_embd)  # Pre-feedforward layer norm
+        self.feedforward = FeedForward(config)
+        self.dropout = nn.Dropout(0.1)
+    
+    def forward(self, x):
+        # Pre-layer normalization before attention + residual connection
+        attn_output = self.attention(self.ln1(x))
+        x = x + self.dropout(attn_output)
+        
+        # Pre-layer normalization before feedforward + residual connection
+        ff_output = self.feedforward(self.ln2(x))
+        x = x + self.dropout(ff_output)
+        
+        return x
+
+class CustomGPT2Model(nn.Module):
+    """
+    Custom decoder-only Transformer architecture implementing GPT-2
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # (a) Token and position embeddings with learned position embeddings
+        self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
+        self.position_embedding = nn.Embedding(config.n_positions, config.n_embd)  # Learned positions
+        
+        # Transformer blocks
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(config) for _ in range(config.n_layer)
+        ])
+        
+        # Final layer norm and output projection
+        self.ln_final = nn.LayerNorm(config.n_embd)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        """Initialize weights following GPT-2 initialization"""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+    
+    def forward(self, input_ids, labels=None):
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+        
+        # (a) Token and position embeddings
+        token_embeds = self.token_embedding(input_ids)
+        position_ids = torch.arange(0, seq_len, dtype=torch.long, device=device)
+        position_embeds = self.position_embedding(position_ids)
+        
+        # Combine embeddings
+        hidden_states = token_embeds + position_embeds
+        
+        # Pass through transformer blocks
+        for block in self.transformer_blocks:
+            hidden_states = block(hidden_states)
+        
+        # Final layer norm and output projection
+        hidden_states = self.ln_final(hidden_states)
+        logits = self.lm_head(hidden_states)
+        
+        # Calculate loss if labels provided
+        loss = None
+        if labels is not None:
+            # Shift labels for causal language modeling
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            
+            loss_fn = nn.CrossEntropyLoss()
+            loss = loss_fn(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1)
+            )
+        
+        return {
+            'logits': logits,
+            'loss': loss
+        }
+    
+    def generate(self, input_ids, max_length=50, temperature=1.0, do_sample=True, pad_token_id=None):
+        """Simple generation method"""
+        self.eval()
+        device = input_ids.device
+        
+        with torch.no_grad():
+            for _ in range(max_length - input_ids.size(1)):
+                outputs = self.forward(input_ids)
+                logits = outputs['logits']
+                
+                # Get next token logits
+                next_token_logits = logits[:, -1, :] / temperature
+                
+                if do_sample:
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                
+                input_ids = torch.cat([input_ids, next_token], dim=-1)
+                
+                # Stop if we hit pad token
+                if pad_token_id is not None and next_token.item() == pad_token_id:
+                    break
+        
+        return input_ids
+
+# ==================== DATA LOADING FUNCTIONS ====================
 
 def load_wikitext_from_local_files(test_mode=False):
     """Load WikiText from local parquet files in same directory"""
@@ -81,43 +279,49 @@ def setup_training_environment():
         print("[WARNING] No GPU detected - training will be slow")
         return "tiny"
 
-def create_gpt2_model(model_size="tiny"):
-    """Create GPT-2 model with specified size"""
+def create_custom_gpt2_model(model_size="tiny"):
+    """Create custom GPT-2 model with specified size"""
     
     tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
     if model_size == "tiny":
-        config = GPT2Config(
+        config = CustomTransformerConfig(
             vocab_size=tokenizer.vocab_size,
-            n_positions=256, n_embd=128, n_layer=2, n_head=4, n_inner=512,
-            bos_token_id=tokenizer.bos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id
+            n_positions=256, n_embd=128, n_layer=2, n_head=4, n_inner=512
         )
     elif model_size == "small":
-        config = GPT2Config(
+        config = CustomTransformerConfig(
             vocab_size=tokenizer.vocab_size,
-            n_positions=512, n_embd=256, n_layer=4, n_head=8, n_inner=1024,
-            bos_token_id=tokenizer.bos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id
+            n_positions=512, n_embd=256, n_layer=4, n_head=8, n_inner=1024
         )
     else:  # medium
-        config = GPT2Config(
+        config = CustomTransformerConfig(
             vocab_size=tokenizer.vocab_size,
-            n_positions=1024, n_embd=512, n_layer=6, n_head=8, n_inner=2048,
-            bos_token_id=tokenizer.bos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id
+            n_positions=1024, n_embd=512, n_layer=6, n_head=8, n_inner=2048
         )
     
-    model = GPT2LMHeadModel(config)
+    model = CustomGPT2Model(config)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"[OK] Model created: {total_params:,} parameters (~{total_params * 4 / (1024**2):.1f} MB)")
+    print(f"[OK] Custom model created: {total_params:,} parameters (~{total_params * 4 / (1024**2):.1f} MB)")
     
     return model, tokenizer
+
+# ==================== CUSTOM TRAINER FOR CUSTOM MODEL ====================
+
+class CustomTrainer(Trainer):
+    """Custom trainer to work with our custom model"""
+    
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """Compute loss using our custom model's forward method"""
+        input_ids = inputs.get("input_ids")
+        labels = inputs.get("labels", input_ids)
+        
+        outputs = model(input_ids=input_ids, labels=labels)
+        loss = outputs['loss']
+        
+        return (loss, outputs) if return_outputs else loss
 
 def tokenize_dataset(dataset, tokenizer, max_length=256):
     """Tokenize dataset for training"""
@@ -149,13 +353,13 @@ def tokenize_dataset(dataset, tokenizer, max_length=256):
     
     return tokenized_dataset
 
-def train_model(model, tokenizer, train_dataset, eval_dataset, test_mode=True):
-    """Train model with optimized settings"""
+def train_custom_model(model, tokenizer, train_dataset, eval_dataset, test_mode=True):
+    """Train custom model with optimized settings"""
     
     # Training arguments
     if test_mode:
         training_args = TrainingArguments(
-            output_dir="./gpt2-model",
+            output_dir="./custom-gpt2-model",
             overwrite_output_dir=True,
             num_train_epochs=1,
             per_device_train_batch_size=4,
@@ -175,7 +379,7 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, test_mode=True):
         )
     else:
         training_args = TrainingArguments(
-            output_dir="./gpt2-model",
+            output_dir="./custom-gpt2-model",
             overwrite_output_dir=True,
             num_train_epochs=2,
             per_device_train_batch_size=8,
@@ -201,8 +405,8 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, test_mode=True):
         pad_to_multiple_of=8
     )
     
-    # Trainer
-    trainer = Trainer(
+    # Custom Trainer
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
         data_collator=data_collator,
@@ -214,7 +418,7 @@ def train_model(model, tokenizer, train_dataset, eval_dataset, test_mode=True):
     trainer.train()
     trainer.save_model()
     
-    print("[OK] Training completed! Model saved to ./gpt2-model")
+    print("[OK] Training completed! Model saved to ./custom-gpt2-model")
     return trainer
 
 def train_custom_bpe_tokenizer(dataset, vocab_size=32000, save_path="custom_bpe_tokenizer"):
@@ -252,11 +456,11 @@ def train_custom_bpe_tokenizer(dataset, vocab_size=32000, save_path="custom_bpe_
 
 # ==================== MAIN TRAINING PIPELINE ====================
 def main_training_pipeline():
-    """Complete training pipeline using local WikiText files"""
+    """Complete training pipeline using custom Transformer and local WikiText files"""
     
     print("=" * 60)
-    print("GPT-2 TRAINING WITH LOCAL WIKITEXT FILES")
-    print("Using WikiText-2-raw-v1 Data from Current Directory")
+    print("CUSTOM GPT-2 TRAINING WITH LOCAL WIKITEXT FILES")
+    print("Using Custom Transformer Architecture Implementation")
     print("=" * 60)
     
     # Setup
@@ -267,9 +471,9 @@ def main_training_pipeline():
     print("\nLoading WikiText data...")
     dataset = load_wikitext_from_local_files(test_mode=TEST_MODE)
     
-    # Create model
-    print(f"\nCreating {recommended_size} model...")
-    model, tokenizer = create_gpt2_model(model_size=recommended_size)
+    # Create custom model
+    print(f"\nCreating custom {recommended_size} model...")
+    model, tokenizer = create_custom_gpt2_model(model_size=recommended_size)
     
     # Move to GPU
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -280,8 +484,8 @@ def main_training_pipeline():
     tokenized_dataset = tokenize_dataset(dataset, tokenizer, max_length=256)
     
     # Train
-    print(f"\nTraining model...")
-    trainer = train_model(
+    print(f"\nTraining custom model...")
+    trainer = train_custom_model(
         model=model,
         tokenizer=tokenizer,
         train_dataset=tokenized_dataset['train'],
@@ -296,18 +500,21 @@ def main_training_pipeline():
     
     for prompt in test_prompts:
         inputs = tokenizer.encode(prompt, return_tensors="pt").to(device)
-        with torch.no_grad():
-            outputs = model.generate(
-                inputs, max_length=50, num_return_sequences=1,
-                temperature=0.8, do_sample=True, pad_token_id=tokenizer.pad_token_id
-            )
+        outputs = model.generate(
+            inputs, max_length=50, temperature=0.8, do_sample=True, 
+            pad_token_id=tokenizer.pad_token_id
+        )
         generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
         print(f"'{prompt}' → '{generated}'")
     
     print(f"\n" + "=" * 60)
-    print("TRAINING COMPLETED!")
-    print("Model saved to: ./gpt2-model")
-    print("You can find the trained model in the gpt2-model directory")
+    print("CUSTOM TRAINING COMPLETED!")
+    print("Custom model saved to: ./custom-gpt2-model")
+    print("Architecture includes:")
+    print("(a) Token and learned position embeddings")
+    print("(b) Multi-head masked self-attention layers") 
+    print("(c) Feedforward layers with GELU activation")
+    print("(d) Pre-layer normalization and residual connections")
     print("=" * 60)
 
 # ==================== RUN TRAINING ====================
