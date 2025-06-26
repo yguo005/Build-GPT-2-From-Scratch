@@ -23,17 +23,30 @@ print("Make sure packages are installed before running this script!")
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
-from datasets import load_dataset
-from transformers import (
-    GPT2Config, 
-    GPT2LMHeadModel, 
-    GPT2Tokenizer,
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    Trainer,
-    TrainingArguments,
-    DataCollatorForLanguageModeling
-)
+try:
+    from datasets import load_dataset
+    print("datasets library loaded successfully")
+except ImportError as e:
+    print(f"Failed to import datasets: {e}")
+    print("Run: !pip install datasets")
+    sys.exit(1)
+
+try:
+    from transformers import (
+        GPT2Config, 
+        GPT2LMHeadModel, 
+        GPT2Tokenizer,
+        AutoTokenizer,
+        AutoModelForCausalLM,
+        Trainer,
+        TrainingArguments,
+        DataCollatorForLanguageModeling
+    )
+    print("transformers library loaded successfully")
+except ImportError as e:
+    print(f"Failed to import transformers: {e}")
+    print("Run: !pip install transformers")
+    sys.exit(1)
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
@@ -44,17 +57,31 @@ from tqdm import tqdm
 import numpy as np
 
 # Set environment variables to handle dataset loading issues
-os.environ["HF_DATASETS_CACHE"] = "/tmp/hf_datasets_cache"
-os.environ["TRANSFORMERS_CACHE"] = "/tmp/transformers_cache"
-os.environ["HF_HOME"] = "/tmp/hf_home"
+def setup_cache_directories():
+    """Setup cache directories safely"""
+    cache_dirs = {
+        "HF_DATASETS_CACHE": "/tmp/hf_datasets_cache",
+        "TRANSFORMERS_CACHE": "/tmp/transformers_cache", 
+        "HF_HOME": "/tmp/hf_home"
+    }
+    
+    for env_var, path in cache_dirs.items():
+        try:
+            os.makedirs(path, exist_ok=True)
+            os.environ[env_var] = path
+            print(f"Set {env_var} to {path}")
+        except Exception as e:
+            print(f"Could not set {env_var}: {e}")
+            # Try to use default cache instead
+            if env_var in os.environ:
+                del os.environ[env_var]
 
-# Create cache directories if they don't exist
-try:
-    os.makedirs("/tmp/hf_datasets_cache", exist_ok=True)
-    os.makedirs("/tmp/transformers_cache", exist_ok=True)
-    os.makedirs("/tmp/hf_home", exist_ok=True)
-except:
-    pass  # Ignore permission errors
+# Setup cache directories
+setup_cache_directories()
+
+# Additional environment settings to prevent pattern issues
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Disable tokenizer parallelism
+os.environ["HF_DATASETS_OFFLINE"] = "0"  # Ensure online mode
 
 # ==================== ENVIRONMENT SETUP ====================
 def check_environment():
@@ -132,8 +159,23 @@ def load_wikitext2_dataset(test_mode=False):
     """Load WikiText-2-raw-v1 dataset"""
     print("Loading WikiText-2-raw-v1 dataset...")
 
-    # Simple, reliable approach - just load the dataset
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", cache_dir=None)
+    try:
+        # Try loading with explicit cache directory
+        cache_dir = "/tmp/hf_datasets_cache"
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", cache_dir=cache_dir)
+    except Exception as e:
+        print(f"First attempt failed: {e}")
+        try:
+            # Try without any cache directory
+            dataset = load_dataset("wikitext", "wikitext-2-raw-v1", cache_dir=None)
+        except Exception as e2:
+            print(f"Second attempt failed: {e2}")
+            try:
+                # Try with default cache
+                dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
+            except Exception as e3:
+                print(f"All attempts failed. Last error: {e3}")
+                raise e3
     
     if test_mode:
         print("TEST MODE: Using small subset of data for quick verification")
@@ -187,11 +229,13 @@ def prepare_dataset_for_training(dataset, tokenizer, max_length=512, use_custom_
                 return_tensors=None
             )
     
-    # Simple dataset mapping without multiprocessing
+    # Simple dataset mapping without multiprocessing  
     tokenized_dataset = dataset.map(
         tokenize_function,
         batched=True,
-        remove_columns=dataset.column_names
+        remove_columns=dataset.column_names,
+        num_proc=1,  # Force single process to avoid pattern issues
+        desc="Tokenizing dataset"
     )
 
     return tokenized_dataset
@@ -507,7 +551,7 @@ def main_training_pipeline(test_mode=True, model_size="tiny", use_custom_tokeniz
 
     for prompt in test_prompts:
         try:
-            generated = generate_text(final_tokenizer, model, prompt, max_length=30)
+            generated = generate_text(model, final_tokenizer, prompt, max_length=30)
             print(f"'{prompt}' → '{generated}'")
         except Exception as e:
             print(f"Error with prompt '{prompt}': {e}")
