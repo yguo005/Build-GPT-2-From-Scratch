@@ -23,6 +23,7 @@ from tokenizers.pre_tokenizers import Whitespace
 
 # ==================== CUSTOM TRANSFORMER ARCHITECTURE ====================
 
+# the default config is for GPT-2 Small 
 class CustomTransformerConfig:
     """Configuration for custom GPT-2 model"""
     def __init__(self, vocab_size=50257, n_positions=1024, n_embd=768, n_layer=12, n_head=12, n_inner=3072):
@@ -67,7 +68,7 @@ class MultiHeadMaskedSelfAttention(nn.Module):
         # Get causal mask for current sequence length
         causal_mask = self.causal_mask[:seq_len, :seq_len]
         
-        # Apply multi-head attention with causal mask
+        # Apply multi-head attention with causal mask AND SCALING
         attn_output, _ = self.attention(
             query=x,
             key=x, 
@@ -364,48 +365,88 @@ def tokenize_dataset(dataset, tokenizer, max_length=256):
     return tokenized_dataset
 
 def train_custom_model(model, tokenizer, train_dataset, eval_dataset, test_mode=True):
-    """Train custom model with optimized settings"""
+    """Train custom model with all specified requirements"""
     
-    # Training arguments
+    # Calculate total training steps for scheduler
+    total_steps = len(train_dataset) // (8 * 2) * 1  # batch_size * grad_accum * epochs
+    warmup_steps = int(0.1 * total_steps)  # 10% warmup
+    
+    # Training arguments with all requirements
     if test_mode:
         training_args = TrainingArguments(
             output_dir="./custom-gpt2-model",
             overwrite_output_dir=True,
             num_train_epochs=1,
-            per_device_train_batch_size=4,
-            per_device_eval_batch_size=4,
-            gradient_accumulation_steps=2,
-            warmup_steps=10,
-            logging_steps=5,
-            save_steps=50,
-            eval_steps=50,
-            eval_strategy="steps",
-            save_total_limit=1,
-            prediction_loss_only=True,
-            fp16=True,  # Use mixed precision for speed
-            dataloader_pin_memory=False,
-            remove_unused_columns=False,
-            report_to=[],  # Disable wandb and other logging
-        )
-    else:
-        training_args = TrainingArguments(
-            output_dir="./custom-gpt2-model",
-            overwrite_output_dir=True,
-            num_train_epochs=2,
+            
+            # ✓ Choose batch size that fits GPU memory (8 or 16)
             per_device_train_batch_size=8,
             per_device_eval_batch_size=8,
-            gradient_accumulation_steps=4,
-            warmup_steps=100,
-            logging_steps=50,
-            save_steps=500,
-            eval_steps=500,
+            
+            # ✓ Use gradient accumulation to simulate larger batches
+            gradient_accumulation_steps=2,  # Effective batch size = 8 * 2 = 16
+            
+            # ✓ Learning rate scheduling: warmup + cosine decay
+            warmup_steps=warmup_steps,
+            lr_scheduler_type="cosine",  # Cosine decay after warmup
+            learning_rate=5e-5,
+            
+            # ✓ AdamW optimizer with weight decay
+            optim="adamw_torch",
+            weight_decay=0.01,
+            
+            # ✓ Report loss at regular intervals
+            logging_steps=10,  # Every X gradient updates
+            eval_steps=50,
             eval_strategy="steps",
-            save_total_limit=2,
+            
+            # ✓ Model checkpointing
+            save_steps=100,
+            save_total_limit=3,  # Keep last 3 checkpoints
+            
             prediction_loss_only=True,
             fp16=True,
             dataloader_pin_memory=False,
             remove_unused_columns=False,
-            report_to=[],  # Disable wandb and other logging
+            report_to=[],
+        )
+    else:
+        # Full training configuration
+        total_steps = len(train_dataset) // (16 * 4) * 2  # batch_size * grad_accum * epochs
+        warmup_steps = int(0.1 * total_steps)
+        
+        training_args = TrainingArguments(
+            output_dir="./custom-gpt2-model",
+            overwrite_output_dir=True,
+            num_train_epochs=2,
+            
+            # ✓ Larger batch size for full training
+            per_device_train_batch_size=16,
+            per_device_eval_batch_size=16,
+            
+            # ✓ Gradient accumulation
+            gradient_accumulation_steps=4,  # Effective batch size = 16 * 4 = 64
+            
+            # ✓ Learning rate scheduling
+            warmup_steps=warmup_steps,
+            lr_scheduler_type="cosine",
+            learning_rate=3e-5,
+            
+            # ✓ AdamW with weight decay
+            optim="adamw_torch",
+            weight_decay=0.01,
+            
+            # ✓ Regular reporting and checkpointing
+            logging_steps=50,
+            eval_steps=200,
+            eval_strategy="steps",
+            save_steps=500,
+            save_total_limit=3,
+            
+            prediction_loss_only=True,
+            fp16=True,
+            dataloader_pin_memory=False,
+            remove_unused_columns=False,
+            report_to=[],
         )
     
     # Data collator
@@ -464,6 +505,274 @@ def train_custom_bpe_tokenizer(dataset, vocab_size=32000, save_path="custom_bpe_
     
     return tokenizer
 
+# ==================== EVALUATION FUNCTIONS ====================
+
+@torch.no_grad()
+def estimate_loss(model, tokenized_datasets, tokenizer, eval_iters=100, batch_size=8):
+    """
+    Estimate loss on training and validation sets
+    
+    Args:
+        model: The trained model
+        tokenized_datasets: Dict with 'train' and 'validation' datasets
+        tokenizer: The tokenizer used
+        eval_iters: Number of batches to evaluate
+        batch_size: Batch size for evaluation
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    
+    results = {}
+    
+    for split in ['train', 'validation']:
+        if split not in tokenized_datasets:
+            continue
+            
+        dataset = tokenized_datasets[split]
+        losses = []
+        
+        # Create dataloader for evaluation
+        from torch.utils.data import DataLoader
+        dataloader = DataLoader(
+            dataset, 
+            batch_size=batch_size, 
+            shuffle=True,
+            collate_fn=lambda x: {
+                'input_ids': torch.stack([torch.tensor(item['input_ids']) for item in x]),
+                'attention_mask': torch.stack([torch.tensor(item['attention_mask']) for item in x])
+            }
+        )
+        
+        # Evaluate for specified number of iterations
+        for i, batch in enumerate(dataloader):
+            if i >= eval_iters:
+                break
+                
+            input_ids = batch['input_ids'].to(device)
+            
+            # Forward pass
+            outputs = model(input_ids=input_ids, labels=input_ids)
+            loss = outputs['loss']
+            
+            if loss is not None:
+                losses.append(loss.item())
+        
+        if losses:
+            results[split] = sum(losses) / len(losses)
+        else:
+            results[split] = float('inf')
+    
+    model.train()  # Reset to training mode
+    return results
+
+@torch.no_grad()
+def calculate_perplexity(model, tokenized_dataset, tokenizer, eval_iters=100, batch_size=8):
+    """
+    Calculate perplexity on a dataset
+    
+    Args:
+        model: The trained model
+        tokenized_dataset: Dataset to evaluate on
+        tokenizer: The tokenizer used
+        eval_iters: Number of batches to evaluate
+        batch_size: Batch size for evaluation
+    
+    Returns:
+        float: Perplexity score
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    
+    total_loss = 0
+    total_tokens = 0
+    
+    # Create dataloader for evaluation
+    from torch.utils.data import DataLoader
+    dataloader = DataLoader(
+        tokenized_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,  # Don't shuffle for consistent evaluation
+        collate_fn=lambda x: {
+            'input_ids': torch.stack([torch.tensor(item['input_ids']) for item in x]),
+            'attention_mask': torch.stack([torch.tensor(item['attention_mask']) for item in x])
+        }
+    )
+    
+    # Evaluate for specified number of iterations
+    for i, batch in enumerate(dataloader):
+        if i >= eval_iters:
+            break
+            
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        
+        # Forward pass
+        outputs = model(input_ids=input_ids, labels=input_ids)
+        loss = outputs['loss']
+        
+        if loss is not None:
+            # Count actual tokens (excluding padding)
+            num_tokens = attention_mask.sum().item()
+            total_loss += loss.item() * num_tokens
+            total_tokens += num_tokens
+    
+    if total_tokens == 0:
+        return float('inf')
+    
+    # Calculate average loss and convert to perplexity
+    avg_loss = total_loss / total_tokens
+    perplexity = torch.exp(torch.tensor(avg_loss)).item()
+    
+    model.train()  # Reset to training mode
+    return perplexity
+
+@torch.no_grad()
+def evaluate_model_comprehensive(model, tokenized_datasets, tokenizer, model_name="Custom"):
+    """
+    Comprehensive evaluation including perplexity on all splits
+    
+    Args:
+        model: The trained model
+        tokenized_datasets: Dict with 'train', 'validation', 'test' datasets
+        tokenizer: The tokenizer used
+        model_name: Name for logging
+    
+    Returns:
+        dict: Evaluation results
+    """
+    print(f"\n{'='*50}")
+    print(f"COMPREHENSIVE EVALUATION: {model_name}")
+    print(f"{'='*50}")
+    
+    results = {}
+    
+    # Evaluate on all available splits
+    for split in ['train', 'validation', 'test']:
+        if split not in tokenized_datasets:
+            continue
+            
+        print(f"\nEvaluating on {split} set...")
+        
+        # Calculate loss
+        loss_result = estimate_loss(model, {split: tokenized_datasets[split]}, tokenizer, eval_iters=50)
+        loss = loss_result.get(split, float('inf'))
+        
+        # Calculate perplexity
+        perplexity = calculate_perplexity(model, tokenized_datasets[split], tokenizer, eval_iters=50)
+        
+        results[split] = {
+            'loss': loss,
+            'perplexity': perplexity
+        }
+        
+        print(f"{split.capitalize()} Loss: {loss:.4f}")
+        print(f"{split.capitalize()} Perplexity: {perplexity:.2f}")
+    
+    return results
+
+def compare_model_sizes(dataset, tokenizer, model_sizes=['tiny', 'small'], test_mode=True):
+    """
+    Compare different model sizes in terms of performance and efficiency
+    
+    Args:
+        dataset: The dataset to train/evaluate on
+        tokenizer: The tokenizer to use
+        model_sizes: List of model sizes to compare
+        test_mode: Whether to use test mode (faster training)
+    
+    Returns:
+        dict: Comparison results
+    """
+    print(f"\n{'='*60}")
+    print("MODEL SIZE COMPARISON")
+    print(f"{'='*60}")
+    
+    comparison_results = {}
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    for size in model_sizes:
+        print(f"\n--- Training {size.upper()} model ---")
+        
+        # Create model
+        model, _ = create_custom_gpt2_model(model_size=size)
+        model = model.to(device)
+        
+        # Get model info
+        total_params = sum(p.numel() for p in model.parameters())
+        model_size_mb = total_params * 4 / (1024**2)
+        
+        # Tokenize data
+        tokenized_dataset = tokenize_dataset(dataset, tokenizer, max_length=128)
+        
+        # Train model (with timing)
+        import time
+        start_time = time.time()
+        
+        trainer = train_custom_model(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=tokenized_dataset['train'],
+            eval_dataset=tokenized_dataset['validation'],
+            test_mode=test_mode
+        )
+        
+        training_time = time.time() - start_time
+        
+        # Comprehensive evaluation
+        eval_results = evaluate_model_comprehensive(
+            model, tokenized_dataset, tokenizer, model_name=f"{size.upper()} GPT-2"
+        )
+        
+        # Test generation quality
+        print(f"\nTesting generation quality for {size} model...")
+        model.eval()
+        generation_examples = []
+        
+        test_prompts = ["The future of AI", "Once upon a time", "Science shows that"]
+        for prompt in test_prompts:
+            inputs = tokenizer.encode(prompt, return_tensors="pt").to(device)
+            outputs = model.generate(
+                inputs, max_length=30, temperature=0.8, do_sample=True, 
+                pad_token_id=tokenizer.pad_token_id
+            )
+            generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            generation_examples.append(f"'{prompt}' → '{generated}'")
+            print(f"  {generation_examples[-1]}")
+        
+        # Store results
+        comparison_results[size] = {
+            'parameters': total_params,
+            'size_mb': model_size_mb,
+            'training_time': training_time,
+            'evaluation': eval_results,
+            'generation_examples': generation_examples
+        }
+        
+        # Clean up memory
+        del model, trainer
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    # Print comparison summary
+    print(f"\n{'='*60}")
+    print("COMPARISON SUMMARY")
+    print(f"{'='*60}")
+    print(f"{'Model':<10} {'Params':<12} {'Size(MB)':<10} {'Train Time':<12} {'Val Loss':<10} {'Val PPL':<10}")
+    print("-" * 70)
+    
+    for size, results in comparison_results.items():
+        params = f"{results['parameters']:,}"
+        size_mb = f"{results['size_mb']:.1f}"
+        train_time = f"{results['training_time']:.1f}s"
+        val_loss = results['evaluation'].get('validation', {}).get('loss', 'N/A')
+        val_ppl = results['evaluation'].get('validation', {}).get('perplexity', 'N/A')
+        
+        val_loss_str = f"{val_loss:.3f}" if val_loss != 'N/A' else 'N/A'
+        val_ppl_str = f"{val_ppl:.1f}" if val_ppl != 'N/A' else 'N/A'
+        
+        print(f"{size:<10} {params:<12} {size_mb:<10} {train_time:<12} {val_loss_str:<10} {val_ppl_str:<10}")
+    
+    return comparison_results
+
 # ==================== MAIN TRAINING PIPELINE ====================
 def main_training_pipeline():
     """Complete training pipeline using custom Transformer and local WikiText files"""
@@ -491,7 +800,7 @@ def main_training_pipeline():
     
     # Tokenize
     print(f"\nTokenizing data...")
-    tokenized_dataset = tokenize_dataset(dataset, tokenizer, max_length=256)
+    tokenized_dataset = tokenize_dataset(dataset, tokenizer, max_length=128)
     
     # Train
     print(f"\nTraining custom model...")
@@ -502,6 +811,10 @@ def main_training_pipeline():
         eval_dataset=tokenized_dataset['validation'],
         test_mode=TEST_MODE
     )
+    
+    # Comprehensive evaluation including perplexity
+    print(f"\nPerforming comprehensive evaluation...")
+    eval_results = evaluate_model_comprehensive(model, tokenized_dataset, tokenizer, "Custom GPT-2")
     
     # Test generation
     print(f"\nTesting text generation...")
@@ -527,6 +840,36 @@ def main_training_pipeline():
     print("(d) Pre-layer normalization and residual connections")
     print("=" * 60)
 
+def run_model_comparison():
+    """Run comparison between different model sizes"""
+    print("=" * 60)
+    print("MODEL SIZE COMPARISON EXPERIMENT")
+    print("=" * 60)
+    
+    # Load data
+    dataset = load_wikitext_from_local_files(test_mode=True)
+    
+    # Create tokenizer
+    _, tokenizer = create_custom_gpt2_model(model_size="tiny")
+    
+    # Compare different model sizes
+    comparison_results = compare_model_sizes(
+        dataset=dataset,
+        tokenizer=tokenizer,
+        model_sizes=['tiny', 'small'],  # Add more sizes as needed: ['tiny', 'small', 'medium']
+        test_mode=True
+    )
+    
+    return comparison_results
+
 # ==================== RUN TRAINING ====================
 if __name__ == "__main__":
-    main_training_pipeline() 
+    # Choose what to run
+    RUN_TRAINING = True
+    RUN_MODEL_COMPARISON = False  # Set to True to compare model sizes
+    
+    if RUN_TRAINING:
+        main_training_pipeline()
+    
+    if RUN_MODEL_COMPARISON:
+        run_model_comparison()
