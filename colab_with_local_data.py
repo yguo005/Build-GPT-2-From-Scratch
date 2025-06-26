@@ -286,20 +286,30 @@ def create_custom_gpt2_model(model_size="tiny"):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    if model_size == "tiny":
+    if model_size == "small":  # GPT-2 Small (117M)
+        config = CustomTransformerConfig(
+            vocab_size=tokenizer.vocab_size,
+            n_positions=1024, n_embd=768, n_layer=12, n_head=12, n_inner=3072
+        )
+    elif model_size == "medium":  # GPT-2 Medium (345M)
+        config = CustomTransformerConfig(
+            vocab_size=tokenizer.vocab_size,
+            n_positions=1024, n_embd=1024, n_layer=24, n_head=16, n_inner=4096
+        )
+    elif model_size == "large":  # GPT-2 Large (762M)
+        config = CustomTransformerConfig(
+            vocab_size=tokenizer.vocab_size,
+            n_positions=1024, n_embd=1280, n_layer=36, n_head=20, n_inner=5120
+        )
+    elif model_size == "xl":  # GPT-2 XL (1.5B)
+        config = CustomTransformerConfig(
+            vocab_size=tokenizer.vocab_size,
+            n_positions=1024, n_embd=1600, n_layer=48, n_head=25, n_inner=6400
+        )
+    else:  # tiny (for testing)
         config = CustomTransformerConfig(
             vocab_size=tokenizer.vocab_size,
             n_positions=256, n_embd=128, n_layer=2, n_head=4, n_inner=512
-        )
-    elif model_size == "small":
-        config = CustomTransformerConfig(
-            vocab_size=tokenizer.vocab_size,
-            n_positions=512, n_embd=256, n_layer=4, n_head=8, n_inner=1024
-        )
-    else:  # medium
-        config = CustomTransformerConfig(
-            vocab_size=tokenizer.vocab_size,
-            n_positions=1024, n_embd=512, n_layer=6, n_head=8, n_inner=2048
         )
     
     model = CustomGPT2Model(config)
