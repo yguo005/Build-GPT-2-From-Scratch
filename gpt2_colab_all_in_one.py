@@ -23,17 +23,30 @@ print("Make sure packages are installed before running this script!")
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
-from datasets import load_dataset
-from transformers import (
-    GPT2Config, 
-    GPT2LMHeadModel, 
-    GPT2Tokenizer,
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    Trainer,
-    TrainingArguments,
-    DataCollatorForLanguageModeling
-)
+try:
+    from datasets import load_dataset
+    print("datasets library loaded successfully")
+except ImportError as e:
+    print(f"Failed to import datasets: {e}")
+    print("Run: !pip install datasets")
+    sys.exit(1)
+
+try:
+    from transformers import (
+        GPT2Config, 
+        GPT2LMHeadModel, 
+        GPT2Tokenizer,
+        AutoTokenizer,
+        AutoModelForCausalLM,
+        Trainer,
+        TrainingArguments,
+        DataCollatorForLanguageModeling
+    )
+    print("transformers library loaded successfully")
+except ImportError as e:
+    print(f"Failed to import transformers: {e}")
+    print("Run: !pip install transformers")
+    sys.exit(1)
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
@@ -44,24 +57,42 @@ from tqdm import tqdm
 import numpy as np
 
 # Set environment variables to handle dataset loading issues
-os.environ["HF_DATASETS_CACHE"] = "/tmp/hf_datasets_cache"
-os.environ["TRANSFORMERS_CACHE"] = "/tmp/transformers_cache"
-os.environ["HF_HOME"] = "/tmp/hf_home"
+def setup_cache_directories():
+    """Setup cache directories safely"""
+    cache_dirs = {
+        "HF_DATASETS_CACHE": "/tmp/hf_datasets_cache",
+        "TRANSFORMERS_CACHE": "/tmp/transformers_cache", 
+        "HF_HOME": "/tmp/hf_home"
+    }
+    
+    for env_var, path in cache_dirs.items():
+        try:
+            os.makedirs(path, exist_ok=True)
+            os.environ[env_var] = path
+            print(f"Set {env_var} to {path}")
+        except Exception as e:
+            print(f"Could not set {env_var}: {e}")
+            # Try to use default cache instead
+            if env_var in os.environ:
+                del os.environ[env_var]
 
-# Create cache directories if they don't exist
+# Setup cache directories (optional - will be bypassed if problematic)
 try:
-    os.makedirs("/tmp/hf_datasets_cache", exist_ok=True)
-    os.makedirs("/tmp/transformers_cache", exist_ok=True)
-    os.makedirs("/tmp/hf_home", exist_ok=True)
-except:
-    pass  # Ignore permission errors
+    setup_cache_directories()
+except Exception as e:
+    print(f"Cache setup failed (will use fallback): {e}")
+
+# Additional environment settings to prevent pattern issues
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Disable tokenizer parallelism
+os.environ["HF_DATASETS_OFFLINE"] = "0"  # Ensure online mode
+os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "true"  # Allow remote code execution
 
 # ==================== ENVIRONMENT SETUP ====================
 def check_environment():
     """Check GPU availability and environment"""
     try:
         import google.colab
-        print("🌟 Running in Google Colab")
+        print("Running in Google Colab")
         in_colab = True
     except ImportError:
         print(" Running locally")
@@ -128,23 +159,264 @@ def train_custom_bpe_tokenizer(dataset, vocab_size=8000, save_path="custom_token
     return tokenizer
 
 # ==================== DATASET FUNCTIONS ====================
-def load_wikitext2_dataset(test_mode=False):
-    """Load WikiText-2-raw-v1 dataset"""
-    print("Loading WikiText-2-raw-v1 dataset...")
 
-    # Simple, reliable approach - just load the dataset
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", cache_dir=None)
+def create_simple_text_dataset(test_mode=False):
+    """Create a simple synthetic dataset as fallback"""
+    print("📝 Creating synthetic fallback dataset...")
     
+    sample_texts = [
+        "The quick brown fox jumps over the lazy dog.",
+        "In machine learning, neural networks are computational models.",
+        "Python is a versatile programming language for data science.",
+        "Artificial intelligence is transforming various industries.",
+        "Deep learning models require large amounts of training data.",
+        "Natural language processing enables computers to understand text.",
+        "Computer vision allows machines to interpret visual information.",
+        "Reinforcement learning helps agents learn through interaction.",
+        "Data preprocessing is crucial for machine learning success.",
+        "Feature engineering improves model performance significantly."
+    ] * (10 if test_mode else 100)
+    
+    from datasets import Dataset, DatasetDict
+    
+    # Create train/validation/test splits
+    train_size = len(sample_texts) // 2
+    val_size = len(sample_texts) // 4
+    
+    train_data = [{"text": text} for text in sample_texts[:train_size]]
+    val_data = [{"text": text} for text in sample_texts[train_size:train_size + val_size]]
+    test_data = [{"text": text} for text in sample_texts[train_size + val_size:]]
+    
+    return DatasetDict({
+        'train': Dataset.from_list(train_data),
+        'validation': Dataset.from_list(val_data),
+        'test': Dataset.from_list(test_data)
+    })
+
+def load_from_local_parquet(data_dir=".", test_mode=False):
+    """Load WikiText dataset from local parquet files (same directory as notebook)"""
+    import pandas as pd
+    from datasets import Dataset, DatasetDict
+    
+    print(f"📂 Loading WikiText from local parquet files in {os.path.abspath(data_dir)}...")
+    
+    files = {
+        "train": "train-00000-of-00001.parquet",
+        "validation": "validation-00000-of-00001.parquet", 
+        "test": "test-00000-of-00001.parquet"
+    }
+    
+    datasets = {}
+    for split, filename in files.items():
+        file_path = os.path.join(data_dir, filename)
+        
+        if not os.path.exists(file_path):
+            print(f"❌ File not found: {file_path}")
+            print("💡 Run the download step first or use load_wikitext2_dataset() instead")
+            return None
+        
+        try:
+            # Read parquet file
+            df = pd.read_parquet(file_path)
+            print(f"✓ Loaded {split}: {len(df)} samples")
+            
+            # Convert to Hugging Face Dataset
+            datasets[split] = Dataset.from_pandas(df)
+            
+        except Exception as e:
+            print(f"❌ Failed to load {split}: {e}")
+            return None
+    
+    # Create DatasetDict
+    dataset = DatasetDict(datasets)
+    
+    # Apply test mode filtering if needed
     if test_mode:
+        print("🧪 TEST MODE: Using subset of data")
+        dataset['train'] = dataset['train'].select(range(min(100, len(dataset['train']))))
+        dataset['validation'] = dataset['validation'].select(range(min(20, len(dataset['validation']))))
+    
+    print(f"📊 Final dataset sizes:")
+    print(f"   Train: {len(dataset['train']):,} samples")
+    print(f"   Validation: {len(dataset['validation']):,} samples")
+    print(f"   Test: {len(dataset['test']):,} samples")
+    
+    return dataset
+
+def download_wikitext_parquet_files(data_dir="."):
+    """Download WikiText-2-raw-v1 parquet files directly from Hugging Face"""
+    import urllib.request
+    import subprocess
+    
+    base_url = "https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-2-raw-v1/"
+    files = {
+        "train": "train-00000-of-00001.parquet",
+        "validation": "validation-00000-of-00001.parquet", 
+        "test": "test-00000-of-00001.parquet"
+    }
+    
+    print(f"📥 Downloading WikiText-2-raw-v1 dataset files to {os.path.abspath(data_dir)}...")
+    
+    downloaded_files = {}
+    for split, filename in files.items():
+        url = base_url + filename
+        local_path = os.path.join(data_dir, filename)
+        
+        if os.path.exists(local_path):
+            print(f"✓ {filename} already exists")
+        else:
+            print(f"⬇️ Downloading {filename}...")
+            try:
+                # Try to detect if we're in Colab
+                try:
+                    import google.colab
+                    # Use subprocess to run wget in Colab
+                    subprocess.run(['wget', '-q', url, '-O', local_path], check=True)
+                except ImportError:
+                    # Use urllib for local environments
+                    urllib.request.urlretrieve(url, local_path)
+                print(f"✓ Downloaded {filename}")
+            except Exception as e:
+                print(f"❌ Failed to download {filename}: {e}")
+                return None
+        
+        downloaded_files[split] = local_path
+    
+    return downloaded_files
+
+def load_wikitext2_dataset(test_mode=False, use_local_files=True):
+    """
+    Load WikiText-2-raw-v1 dataset with robust error handling
+    
+    Tries multiple loading methods in order:
+    1. Local parquet files (fastest, most reliable)
+    2. Salesforce/wikitext with cache
+    3. Legacy wikitext with cache  
+    4. Salesforce/wikitext without cache
+    5. Legacy wikitext without cache
+    6. Streaming mode
+    7. Synthetic fallback dataset
+    
+    Args:
+        test_mode (bool): If True, uses only subset of data for quick testing
+        use_local_files (bool): If True, try local parquet files first
+        
+    Returns:
+        DatasetDict: Loaded dataset with train/validation/test splits
+    """
+    print("🔄 Loading WikiText-2-raw-v1 dataset...")
+    
+    # Method 1: Try local parquet files first (Colab-optimized)
+    if use_local_files:
+        print("🔍 Checking for local parquet files...")
+        
+        # Try to download if files don't exist in current directory
+        data_dir = "."  # Current directory (same as notebook)
+        parquet_files = ["train-00000-of-00001.parquet", "validation-00000-of-00001.parquet", "test-00000-of-00001.parquet"]
+        
+        if not any(os.path.exists(f) for f in parquet_files):
+            print("📥 Local files not found. Downloading...")
+            download_result = download_wikitext_parquet_files(data_dir)
+            if download_result is None:
+                print("❌ Download failed, falling back to Hugging Face datasets...")
+            else:
+                dataset = load_from_local_parquet(data_dir, test_mode)
+                if dataset is not None:
+                    return dataset
+        else:
+            print("📁 Found local files, loading...")
+            dataset = load_from_local_parquet(data_dir, test_mode)
+            if dataset is not None:
+                return dataset
+    
+    print("🔄 Local files unavailable, trying Hugging Face datasets library...")
+
+    # Clear any problematic environment variables
+    problematic_vars = ['HF_DATASETS_CACHE', 'TRANSFORMERS_CACHE', 'HF_HOME']
+    original_values = {}
+    
+    try:
+        # Temporarily remove cache environment variables
+        for var in problematic_vars:
+            if var in os.environ:
+                original_values[var] = os.environ[var]
+                del os.environ[var]
+        
+        print("Attempting to load dataset...")
+        
+        # Import here to avoid caching issues
+        import tempfile
+        import shutil
+        
+        # Create a clean temporary directory
+        temp_cache = tempfile.mkdtemp(prefix="hf_cache_")
+        print(f"Using temporary cache: {temp_cache}")
+        
+        # Try multiple loading methods in order of preference
+        loading_methods = [
+            ("Salesforce/wikitext", temp_cache, "Salesforce path with cache"),
+            ("wikitext", temp_cache, "legacy path with cache"),
+            ("Salesforce/wikitext", None, "Salesforce path without cache"),
+            ("wikitext", None, "legacy path without cache")
+        ]
+        
+        dataset = None
+        for dataset_name, cache_dir, method_desc in loading_methods:
+            try:
+                print(f"Trying {method_desc}...")
+                dataset = load_dataset(dataset_name, "wikitext-2-raw-v1", cache_dir=cache_dir)
+                print(f"✓ Dataset loaded successfully with {method_desc}")
+                break
+            except Exception as e:
+                print(f"Failed {method_desc}: {e}")
+                continue
+        
+        # If all regular methods failed, try streaming
+        if dataset is None:
+            try:
+                print("Trying streaming mode...")
+                dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", streaming=True)
+                # Convert streaming to regular dataset
+                train_data = list(dataset['train'].take(1000 if not test_mode else 100))
+                val_data = list(dataset['validation'].take(200 if not test_mode else 20))
+                test_data = list(dataset['test'].take(200 if not test_mode else 20))
+                
+                # Create a simple dataset structure
+                from datasets import Dataset, DatasetDict
+                dataset = DatasetDict({
+                    'train': Dataset.from_list(train_data),
+                    'validation': Dataset.from_list(val_data),
+                    'test': Dataset.from_list(test_data)
+                })
+                print("✓ Dataset loaded successfully with streaming")
+            except Exception as e:
+                print(f"Streaming failed: {e}")
+                # Final fallback: create a simple synthetic dataset
+                print(f"All loading methods failed. Using fallback synthetic dataset...")
+                dataset = create_simple_text_dataset(test_mode)
+        
+        # Clean up temp directory
+        try:
+            if 'temp_cache' in locals():
+                shutil.rmtree(temp_cache, ignore_errors=True)
+        except:
+            pass
+            
+    finally:
+        # Restore original environment variables
+        for var, value in original_values.items():
+            os.environ[var] = value
+    
+    if test_mode and dataset is not None and hasattr(dataset['train'], 'select'):
         print("TEST MODE: Using small subset of data for quick verification")
-        train_size = min(100, len(dataset['train']))  # Only 100 training samples
-        val_size = min(20, len(dataset['validation'])) # Only 20 validation samples
+        train_size = min(100, len(dataset['train']))
+        val_size = min(20, len(dataset['validation']))
         
         dataset['train'] = dataset['train'].select(range(train_size))
         dataset['validation'] = dataset['validation'].select(range(val_size))
 
     print(f"Train: {len(dataset['train'])} samples")
-    print(f"Validation: {len(dataset['validation'])} samples")
+    print(f"Validation: {len(dataset['validation'])} samples") 
     print(f"Test: {len(dataset['test'])} samples")
 
     return dataset
@@ -187,11 +459,13 @@ def prepare_dataset_for_training(dataset, tokenizer, max_length=512, use_custom_
                 return_tensors=None
             )
     
-    # Simple dataset mapping without multiprocessing
+    # Simple dataset mapping without multiprocessing  
     tokenized_dataset = dataset.map(
         tokenize_function,
         batched=True,
-        remove_columns=dataset.column_names
+        remove_columns=dataset.column_names,
+        num_proc=1,  # Force single process to avoid pattern issues
+        desc="Tokenizing dataset"
     )
 
     return tokenized_dataset
@@ -507,7 +781,7 @@ def main_training_pipeline(test_mode=True, model_size="tiny", use_custom_tokeniz
 
     for prompt in test_prompts:
         try:
-            generated = generate_text(final_tokenizer, model, prompt, max_length=30)
+            generated = generate_text(model, final_tokenizer, prompt, max_length=30)
             print(f"'{prompt}' → '{generated}'")
         except Exception as e:
             print(f"Error with prompt '{prompt}': {e}")
