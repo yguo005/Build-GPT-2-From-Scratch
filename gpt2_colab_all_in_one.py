@@ -61,7 +61,7 @@ def check_environment():
     """Check GPU availability and environment"""
     try:
         import google.colab
-        print("🌟 Running in Google Colab")
+        print("Running in Google Colab")
         in_colab = True
     except ImportError:
         print(" Running locally")
