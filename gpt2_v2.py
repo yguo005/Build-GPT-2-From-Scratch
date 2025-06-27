@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import time
 import pandas as pd
+import contextlib
 
 # =============================================================================
 # 1. HYPERPARAMETERS (GPT-2 Standard Configurations)
@@ -281,7 +282,7 @@ class GPT2Model(nn.Module):
                 config['n_head'], 
                 config['block_size'], 
                 config['dropout'],
-                config['bias']         # <-- add this argument
+                config['bias']         
             ) for _ in range(config['n_layer'])
         ])
         
@@ -520,7 +521,10 @@ def train_model():
     )
     
     # Initialize gradient scaler for mixed precision
-    scaler = torch.amp.GradScaler()
+    if TRAIN_CONFIG['device'] == 'cuda' and torch.cuda.is_available():
+        scaler = torch.amp.GradScaler()
+    else:
+        scaler = None
     
     # Training loop
     train_losses = []
@@ -582,19 +586,26 @@ def train_model():
         for micro_step in range(TRAIN_CONFIG['gradient_accumulation_steps']):
             X, Y = get_batch(train_data, TRAIN_CONFIG['batch_size'], CONFIG['block_size'], TRAIN_CONFIG['device'])
             
-            with torch.amp.autocast(device_type='cuda'):
+            autocast_context = (
+                torch.amp.autocast(device_type='cuda')
+                if TRAIN_CONFIG['device'] == 'cuda' and torch.cuda.is_available()
+                else contextlib.nullcontext()
+            )
+            
+            with autocast_context:
                 logits, loss = model(X, Y)
                 loss = loss / TRAIN_CONFIG['gradient_accumulation_steps']  # Scale loss
             
-            scaler.scale(loss).backward()
-        
-        # Clip gradients
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
-        # Optimizer step
-        scaler.step(optimizer)
-        scaler.update()
+            if scaler:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
     
     # Final evaluation
     print("\nFinal Evaluation:")
@@ -722,7 +733,10 @@ def compare_model_sizes():
         )
         
         # Initialize gradient scaler
-        scaler = torch.amp.GradScaler()
+        if TRAIN_CONFIG['device'] == 'cuda' and torch.cuda.is_available():
+            scaler = torch.amp.GradScaler()
+        else:
+            scaler = None
         
         # Training metrics
         train_losses = []
@@ -766,17 +780,26 @@ def compare_model_sizes():
             for micro_step in range(comparison_train_config['gradient_accumulation_steps']):
                 X, Y = get_batch(train_data, comparison_train_config['batch_size'], config['block_size'], TRAIN_CONFIG['device'])
                 
-                with torch.amp.autocast(device_type='cuda'):
+                autocast_context = (
+                    torch.amp.autocast(device_type='cuda')
+                    if TRAIN_CONFIG['device'] == 'cuda' and torch.cuda.is_available()
+                    else contextlib.nullcontext()
+                )
+                
+                with autocast_context:
                     logits, loss = model(X, Y)
                     loss = loss / comparison_train_config['gradient_accumulation_steps']
                 
-                scaler.scale(loss).backward()
-            
-            # Gradient clipping and optimizer step
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+                if scaler:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
         
         total_training_time = time.time() - start_time
         
