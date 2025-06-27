@@ -1232,7 +1232,7 @@ def main_training_pipeline():
     
     # Setup
     recommended_size = setup_training_environment()
-    TEST_MODE = True  # Set to False for full training
+    TEST_MODE = False  # Set to False for full training
     
     # Load data
     print("\nLoading WikiText data...")
@@ -1240,9 +1240,13 @@ def main_training_pipeline():
     
     # Create custom model with BPE tokenizer as required
     print(f"\nCreating custom {recommended_size} model with BPE tokenizer...")
+    
+    # Option 1: Use custom BPE tokenizer (as per requirements)
+    USE_CUSTOM_BPE = True  # Set to False to use pre-trained GPT-2 tokenizer for debugging
+    
     model, tokenizer = create_custom_gpt2_model(
         model_size=recommended_size, 
-        use_custom_tokenizer=True,  # Use BPE tokenizer as per requirements
+        use_custom_tokenizer=USE_CUSTOM_BPE,  # Toggle this for testing
         dataset=dataset
     )
     
