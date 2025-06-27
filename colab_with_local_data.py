@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import time
 import pandas as pd
 import matplotlib.pyplot as plt
 import json
@@ -27,6 +28,44 @@ from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import Whitespace
+
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTENTION_AVAILABLE = True
+    print("[INFO] FlashAttention available - will use for faster training")
+except ImportError:
+    FLASH_ATTENTION_AVAILABLE = False
+    print("[INFO] FlashAttention not available - using standard attention")
+
+# ==================== BONUS: EFFICIENT ATTENTION INSTALLATION ====================
+"""
+To enable FlashAttention (Bonus requirement), install it with:
+
+pip install flash-attn --no-build-isolation
+
+Or for older systems:
+pip install flash-attn==1.0.9 --no-build-isolation
+
+Note: FlashAttention requires:
+- CUDA-compatible GPU
+- PyTorch with CUDA support
+- Sufficient GPU memory
+
+Benefits of FlashAttention:
+- 2-4x faster training on long sequences
+- Reduced memory usage (O(N) instead of O(N²))
+- Mathematically equivalent to standard attention
+- Better GPU utilization
+
+Alternative: Sparse Attention Methods
+- More complex to implement
+- May affect model quality
+- Less mature library support
+- Better for very long sequences (1K+ tokens)
+
+For sequences of 128 tokens, FlashAttention provides the best trade-off
+between performance gains and implementation complexity.
+"""
 
 # ==================== CUSTOM TRANSFORMER ARCHITECTURE ====================
 
@@ -73,6 +112,7 @@ class CustomTransformerConfig:
 class MultiHeadMaskedSelfAttention(nn.Module):
     """
     (b) Multi-head masked self-attention layers with causal (unidirectional) attention
+    Supports FlashAttention for memory efficiency (Bonus requirement)
     """
     def __init__(self, config):
         super().__init__()
@@ -82,16 +122,34 @@ class MultiHeadMaskedSelfAttention(nn.Module):
         
         assert config.n_embd % config.n_head == 0, "n_embd must be divisible by n_head"
         
-        # Use PyTorch's MultiheadAttention as suggested
-        self.attention = nn.MultiheadAttention(
-            embed_dim=config.n_embd,
-            num_heads=config.n_head,
-            dropout=0.1,
-            batch_first=True  # Use batch_first for easier handling
-        )
+        # Try to use FlashAttention if available (Bonus optimization)
+        if FLASH_ATTENTION_AVAILABLE:
+            try:
+                from flash_attn import FlashMHA
+                self.flash_mha = FlashMHA(
+                    embed_dim=config.n_embd,
+                    num_heads=config.n_head,
+                    causal=True,  # Enable causal attention
+                    dropout=0.1
+                )
+                self.use_flash_attention = True
+                print(f"[BONUS] Using FlashAttention for layer with {config.n_head} heads")
+            except Exception as e:
+                print(f"[WARNING] FlashAttention initialization failed: {e}")
+                self.use_flash_attention = False
+        else:
+            self.use_flash_attention = False
         
-        # Create causal mask
-        self.register_buffer("causal_mask", self._create_causal_mask(config.n_positions))
+        # Fallback to standard PyTorch attention
+        if not self.use_flash_attention:
+            self.attention = nn.MultiheadAttention(
+                embed_dim=config.n_embd,
+                num_heads=config.n_head,
+                dropout=0.1,
+                batch_first=True  # Use batch_first for easier handling
+            )
+            # Create causal mask for standard attention
+            self.register_buffer("causal_mask", self._create_causal_mask(config.n_positions))
     
     def _create_causal_mask(self, seq_len):
         """Create causal mask to prevent attending to future positions"""
@@ -101,16 +159,38 @@ class MultiHeadMaskedSelfAttention(nn.Module):
     def forward(self, x):
         batch_size, seq_len, _ = x.shape
         
+        # Use FlashAttention if available (Bonus optimization)
+        if self.use_flash_attention:
+            # FlashAttention automatically handles causal masking
+            attn_output = self.flash_mha(x)
+            return attn_output
+        else:
+            # Fallback to standard attention with manual causal mask
+            # Get causal mask for current sequence length
+            causal_mask = self.causal_mask[:seq_len, :seq_len]
+            
+            # Apply multi-head attention with causal mask
+            attn_output, _ = self.attention(
+                query=x,
+                key=x, 
+                value=x,
+                attn_mask=causal_mask,
+                need_weights=False
+            )
+            
+            return attn_output
+    
+    def flash_forward(self, x):
+        """FlashAttention forward pass (if available)"""
+        from flash_attn import FlashMHA
+        batch_size, seq_len, _ = x.shape
+        
         # Get causal mask for current sequence length
         causal_mask = self.causal_mask[:seq_len, :seq_len]
         
-        # Apply multi-head attention with causal mask AND SCALING
-        attn_output, _ = self.attention(
-            query=x,
-            key=x, 
-            value=x,
-            attn_mask=causal_mask,
-            need_weights=False
+        # Use FlashAttention for faster training
+        attn_output = FlashMHA.apply(
+            x, x, x, causal_mask, 0.1, False, False, False
         )
         
         return attn_output
@@ -464,7 +544,10 @@ def train_custom_bpe_tokenizer(dataset, vocab_size=32000, save_path="custom_bpe_
     
     # Initialize BPE tokenizer with better configuration
     tokenizer = Tokenizer(BPE(unk_token="<|endoftext|>"))
-    tokenizer.pre_tokenizer = Whitespace()
+    
+    # Use ByteLevel pre-tokenizer instead of Whitespace to reduce fragmentation
+    from tokenizers.pre_tokenizers import ByteLevel
+    tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=True)
     
     # Configure trainer with vocabulary size and better parameters
     trainer = BpeTrainer(
@@ -472,22 +555,42 @@ def train_custom_bpe_tokenizer(dataset, vocab_size=32000, save_path="custom_bpe_
         special_tokens=["<|endoftext|>", "<|pad|>"],
         min_frequency=2,  # Require minimum frequency for merges
         show_progress=True,
-        continuing_subword_prefix="##",  # Use subword prefix like BERT
-        end_of_word_suffix="</w>"  # Mark end of words to prevent over-splitting
+        initial_alphabet=ByteLevel.alphabet()  # Use byte-level alphabet
     )
     
-    # Prepare training data
+    # Prepare training data with more text for better learning
     def batch_iterator():
+        texts = []
         for example in dataset:
             if example['text'].strip():  # Skip empty texts
-                yield example['text']
+                texts.append(example['text'])
+                # Yield in batches for memory efficiency
+                if len(texts) >= 1000:
+                    for text in texts:
+                        yield text
+                    texts = []
+        # Yield remaining texts
+        for text in texts:
+            yield text
     
     # Train the tokenizer on dataset
     tokenizer.train_from_iterator(batch_iterator(), trainer)
     
+    # Add proper post-processor
+    from tokenizers.processors import ByteLevel as ByteLevelProcessor
+    tokenizer.post_processor = ByteLevelProcessor(trim_offsets=True)
+    
     # Save the trained tokenizer
     tokenizer.save(f"{save_path}.json")
     print(f"[OK] Custom BPE tokenizer saved to {save_path}.json")
+    
+    # Test the tokenizer
+    test_text = "The future of artificial intelligence"
+    encoded = tokenizer.encode(test_text)
+    decoded = tokenizer.decode(encoded.ids)
+    print(f"[TEST] Original: '{test_text}'")
+    print(f"[TEST] Decoded: '{decoded}'")
+    print(f"[TEST] Tokens: {len(encoded.ids)} tokens")
     
     return tokenizer
 
@@ -594,26 +697,41 @@ class CustomTrainer(Trainer):
         
         return (loss, outputs) if return_outputs else loss
     
+    def training_step(self, model, inputs):
+        """Override training step to capture loss at every step (like reference)"""
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+        
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+        
+        # Capture training loss at every step like the reference implementation
+        self.train_losses.append(loss.item())
+        self.train_steps.append(self.state.global_step)
+        print(f"[DEBUG] Captured training loss: {loss.item():.4f} at step {self.state.global_step}")
+        
+        if self.args.n_gpu > 1:
+            loss = loss.mean()
+        
+        if self.args.gradient_accumulation_steps > 1:
+            loss = loss / self.args.gradient_accumulation_steps
+        
+        loss.backward()
+        return loss.detach()
+    
     def log(self, logs, start_time=None):
-        """Override log method to capture training loss"""
+        """Override log method to capture evaluation loss"""
         # Call parent method with proper arguments
         if start_time is not None:
             super().log(logs, start_time)
         else:
             super().log(logs)
         
-        # Capture training loss - check multiple possible keys
-        train_loss = logs.get("train_loss") or logs.get("loss")
-        if train_loss is not None:
-            self.train_losses.append(train_loss)
-            self.train_steps.append(self.state.global_step)
-            print(f"[DEBUG] Captured training loss: {train_loss} at step {self.state.global_step}")
-        
-        # Capture evaluation loss
+        # Capture evaluation loss only (training loss is captured in training_step)
         if "eval_loss" in logs:
             self.eval_losses.append(logs["eval_loss"])
             self.eval_steps.append(self.state.global_step)
-            print(f"[DEBUG] Captured eval loss: {logs['eval_loss']} at step {self.state.global_step}")
+            print(f"[DEBUG] Captured eval loss: {logs['eval_loss']:.4f} at step {self.state.global_step}")
     
     def get_loss_curves(self):
         """Return training and validation loss curves"""
@@ -776,9 +894,9 @@ def analyze_training_progress(loss_file="./loss_curves.json"):
         
         if 'potential_overfitting' in analysis:
             if analysis['potential_overfitting']:
-                print("⚠️  Potential overfitting detected (validation loss trending upward)")
+                print("Potential overfitting detected (validation loss trending upward)")
             else:
-                print("✅ No obvious overfitting detected")
+                print("No obvious overfitting detected")
         
         if 'training_stability' in analysis:
             print(f"Training Stability: {analysis['training_stability']}")
@@ -1173,36 +1291,6 @@ def compare_model_sizes(dataset, tokenizer, model_sizes=['tiny', 'small'], test_
         generation_examples = []
         
         test_prompts = ["The future of AI", "Once upon a time", "Science shows that"]
-        for prompt in test_prompts:
-            try:
-                # Handle different tokenizer types
-                if hasattr(custom_tokenizer, 'encode') and hasattr(custom_tokenizer, 'get_vocab_size'):
-                    # Custom BPE tokenizer
-                    encoded = custom_tokenizer.encode(prompt)
-                    inputs = torch.tensor([encoded.ids], dtype=torch.long).to(device)
-                    pad_token_id = 0
-                else:
-                    # Hugging Face tokenizer
-                    inputs = custom_tokenizer.encode(prompt, return_tensors="pt").to(device)
-                    pad_token_id = custom_tokenizer.pad_token_id
-                
-                outputs = model.generate(
-                    inputs, max_length=30, temperature=0.8, do_sample=True, 
-                    pad_token_id=pad_token_id
-                )
-                
-                # Decode based on tokenizer type
-                if hasattr(custom_tokenizer, 'decode') and hasattr(custom_tokenizer, 'get_vocab_size'):
-                    # Custom BPE tokenizer
-                    generated = custom_tokenizer.decode(outputs[0].tolist())
-                else:
-                    # Hugging Face tokenizer
-                    generated = custom_tokenizer.decode(outputs[0], skip_special_tokens=True)
-                
-                generation_examples.append(f"'{prompt}' → '{generated}'")
-                print(f"  {generation_examples[-1]}")
-            except Exception as e:
-                error_msg = f"'{prompt}' → [Error: {str(e)}]"
                 generation_examples.append(error_msg)
                 print(f"  {error_msg}")
         
@@ -1240,481 +1328,381 @@ def compare_model_sizes(dataset, tokenizer, model_sizes=['tiny', 'small'], test_
     
     return comparison_results
 
-# ==================== MAIN TRAINING PIPELINE ====================
-def main_training_pipeline():
-    """Complete training pipeline using custom Transformer and local WikiText files"""
-    
-    print("=" * 60)
-    print("CUSTOM GPT-2 TRAINING WITH LOCAL WIKITEXT FILES")
-    print("Using Custom Transformer Architecture Implementation")
-    print("=" * 60)
-    
-    # Setup
-    recommended_size = setup_training_environment()
-    TEST_MODE = False  # Set to False for full training
-    
-    # Load data
-    print("\nLoading WikiText data...")
-    dataset = load_wikitext_from_local_files(test_mode=TEST_MODE)
-    
-    # Improve tokenizer pipeline
-    create_improved_tokenizer_pipeline()
-    
-    # Create custom model with BPE tokenizer as required
-    print(f"\nCreating custom {recommended_size} model with BPE tokenizer...")
-    
-    # Option 1: Use custom BPE tokenizer (as per requirements)
-    USE_CUSTOM_BPE = True  # Set to False to use pre-trained GPT-2 tokenizer for debugging
-    
-    model, tokenizer = create_custom_gpt2_model(
-        model_size=recommended_size, 
-        use_custom_tokenizer=USE_CUSTOM_BPE,  # Toggle this for testing
-        dataset=dataset
-    )
-    
-    # Move to GPU
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
-    
-    # Tokenize
-    print(f"\nTokenizing data...")
-    tokenized_dataset = tokenize_dataset(dataset, tokenizer, max_length=128)
-    
-    # Train
-    print(f"\nTraining custom model...")
-    trainer = train_custom_model(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=tokenized_dataset['train'],
-        eval_dataset=tokenized_dataset['validation'],
-        test_mode=TEST_MODE
-    )
-    
-    # Comprehensive evaluation including perplexity
-    print(f"\nPerforming comprehensive evaluation...")
-    eval_results = evaluate_model_comprehensive(model, tokenized_dataset, tokenizer, "Custom GPT-2")
-    
-    # Analyze training progress from loss curves
-    print(f"\nAnalyzing training progress...")
-    debug_loss_curves()  # Debug what's actually in the file
-    training_analysis = analyze_training_progress("./loss_curves.json")
-    
-    # Evaluate different generation strategies
-    print(f"\nEvaluating text generation strategies...")
-    generation_results = evaluate_generation_strategies(
-        model=model, 
-        tokenizer=tokenizer, 
-        max_length=80,
-        device=device
-    )
-    
-    # Quick generation test
-    print(f"\nQuick generation examples...")
-    model.eval()
-    test_prompts = ["The", "Once upon", "Science"]
-    
-    for prompt in test_prompts:
-        try:
-            # Handle different tokenizer types
-            if hasattr(tokenizer, 'encode') and hasattr(tokenizer, 'get_vocab_size'):
-                # Custom BPE tokenizer
-                encoded = tokenizer.encode(prompt)
-                inputs = torch.tensor([encoded.ids], dtype=torch.long).to(device)
-                pad_token_id = 0  # Use 0 for custom tokenizer
-            else:
-                # Hugging Face tokenizer
-                inputs = tokenizer.encode(prompt, return_tensors="pt").to(device)
-                pad_token_id = tokenizer.pad_token_id
-            
-            outputs = model.generate_with_strategies(
-                inputs, max_length=50, strategy='nucleus', top_p=0.9, temperature=0.8,
-                pad_token_id=pad_token_id
-            )
-            
-            # Decode the output
-            if hasattr(tokenizer, 'decode') and hasattr(tokenizer, 'get_vocab_size'):
-                # Custom BPE tokenizer
-                generated = tokenizer.decode(outputs[0].tolist())
-            else:
-                # Hugging Face tokenizer
-                generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
-            print(f"'{prompt}' → '{generated}'")
-        except Exception as e:
-            print(f"Error generating text for prompt '{prompt}': {e}")
-            continue
-    
-    print(f"\n" + "=" * 60)
-    print("CUSTOM TRAINING COMPLETED!")
-    print("Custom model saved to: ./custom-gpt2-model")
-    print("Architecture includes:")
-    print("(a) Token and learned position embeddings")
-    print("(b) Multi-head masked self-attention layers") 
-    print("(c) Feedforward layers with GELU activation")
-    print("(d) Pre-layer normalization and residual connections")
-    print("=" * 60)
+# ==================== MANUAL TRAINING FUNCTIONS (Reference Style) ====================
 
-def run_model_comparison():
-    """Run comparison between different model sizes"""
-    print("=" * 60)
-    print("MODEL SIZE COMPARISON EXPERIMENT")
-    print("=" * 60)
-    
-    # Load data
-    dataset = load_wikitext_from_local_files(test_mode=True)
-    
-    # Create tokenizer
-    _, tokenizer = create_custom_gpt2_model(model_size="tiny")
-    
-    # Compare different model sizes
-    comparison_results = compare_model_sizes(
-        dataset=dataset,
-        tokenizer=tokenizer,
-        model_sizes=['tiny', 'small'],  # Add more sizes as needed: ['tiny', 'small', 'medium']
-        test_mode=True
-    )
-    
-    return comparison_results
-
-def evaluate_generation_strategies(model, tokenizer, prompts=None, max_length=100, device='cpu'):
+def get_batch(split, dataset, tokenizer, batch_size=8, block_size=128, device='cpu'):
     """
-    Evaluate different text generation strategies and analyze fluency/diversity
+    Generate a batch of training data like in the reference implementation
     
     Args:
-        model: Trained model
-        tokenizer: Tokenizer
-        prompts: List of prompts to test (default uses standard prompts)
-        max_length: Maximum generation length
-        device: Device to run on
+        split: 'train' or 'val'
+        dataset: The tokenized dataset
+        tokenizer: The tokenizer
+        batch_size: Batch size
+        block_size: Sequence length
+        device: Device to move tensors to
+    """
+    data = dataset[split] if split in dataset else dataset['train']
+    
+    # Get random starting positions
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    
+    # Create input sequences
+    x_batch = []
+    y_batch = []
+    
+    for i in ix:
+        # Get sequence of block_size tokens
+        if i + block_size + 1 < len(data):
+            input_ids = data[i]['input_ids'][:block_size]
+            target_ids = data[i]['input_ids'][1:block_size+1]
+        else:
+            # Handle edge case
+            input_ids = data[i]['input_ids'][:block_size]
+            target_ids = input_ids[1:] + [0]  # Pad with 0
+        
+        # Ensure correct length
+        if len(input_ids) < block_size:
+            input_ids = input_ids + [0] * (block_size - len(input_ids))
+        if len(target_ids) < block_size:
+            target_ids = target_ids + [0] * (block_size - len(target_ids))
+        
+        x_batch.append(input_ids[:block_size])
+        y_batch.append(target_ids[:block_size])
+    
+    x = torch.tensor(x_batch, dtype=torch.long).to(device)
+    y = torch.tensor(y_batch, dtype=torch.long).to(device)
+    
+    return x, y
+
+@torch.no_grad()
+def estimate_loss_manual(model, dataset, tokenizer, eval_iters=100, batch_size=8, block_size=128, device='cpu'):
+    """
+    Estimate loss on train and validation sets like in the reference
+    
+    Args:
+        model: The model to evaluate
+        dataset: The tokenized dataset
+        tokenizer: The tokenizer
+        eval_iters: Number of evaluation iterations
+        batch_size: Batch size
+        block_size: Sequence length
+        device: Device
     
     Returns:
-        dict: Results for each strategy
+        dict: Loss estimates for train and validation
     """
-    if prompts is None:
-        prompts = [
-            "The future of artificial intelligence",
-            "Once upon a time in a distant galaxy",
-            "Climate change is affecting",
-            "The most important discovery in science",
-            "In the year 2050, technology will"
-        ]
-    
-    strategies = {
-        'greedy': {'strategy': 'greedy'},
-        'top_k_10': {'strategy': 'top_k', 'top_k': 10},
-        'top_k_50': {'strategy': 'top_k', 'top_k': 50},
-        'nucleus_0.7': {'strategy': 'nucleus', 'top_p': 0.7},
-        'nucleus_0.9': {'strategy': 'nucleus', 'top_p': 0.9},
-        'nucleus_0.95': {'strategy': 'nucleus', 'top_p': 0.95},
-        'random_low_temp': {'strategy': 'random', 'temperature': 0.5},
-        'random_high_temp': {'strategy': 'random', 'temperature': 1.5}
-    }
-    
-    print(f"\n{'='*80}")
-    print("TEXT GENERATION STRATEGY COMPARISON")
-    print(f"{'='*80}")
-    
-    results = {}
+    out = {}
     model.eval()
     
-    for strategy_name, params in strategies.items():
-        print(f"\n--- {strategy_name.upper().replace('_', ' ')} ---")
-        strategy_results = {
-            'generations': [],
-            'unique_generations': set(),
-            'avg_length': 0,
-            'repetition_scores': []
-        }
-        
-        total_length = 0
-        
-        for i, prompt in enumerate(prompts):
-            print(f"\nPrompt {i+1}: '{prompt}'")
+    for split in ['train', 'validation']:
+        if split not in dataset:
+            continue
             
-            # Generate multiple samples for diversity analysis
-            for sample in range(3):  # Generate 3 samples per prompt
-                try:
-                    # Handle different tokenizer types
-                    if hasattr(tokenizer, 'encode') and hasattr(tokenizer, 'get_vocab_size'):
-                        # Custom BPE tokenizer
-                        encoded = tokenizer.encode(prompt)
-                        inputs = torch.tensor([encoded.ids], dtype=torch.long).to(device)
-                        pad_token_id = 0
-                    else:
-                        # Hugging Face tokenizer
-                        inputs = tokenizer.encode(prompt, return_tensors="pt").to(device)
-                        pad_token_id = tokenizer.pad_token_id
-                    
-                    # Set default parameters
-                    generation_params = {
-                        'input_ids': inputs,
-                        'max_length': max_length,
-                        'temperature': params.get('temperature', 1.0),
-                        'strategy': params.get('strategy', 'greedy'),
-                        'top_k': params.get('top_k', 50),
-                        'top_p': params.get('top_p', 0.9),
-                        'pad_token_id': pad_token_id
-                    }
-                    
-                    outputs = model.generate_with_strategies(**generation_params)
-                    
-                    # Decode based on tokenizer type
-                    if hasattr(tokenizer, 'decode') and hasattr(tokenizer, 'get_vocab_size'):
-                        # Custom BPE tokenizer
-                        generated_text = tokenizer.decode(outputs[0].tolist())
-                    else:
-                        # Hugging Face tokenizer
-                        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                    
-                except Exception as e:
-                    print(f"  Error generating text: {e}")
-                    generated_text = f"[Error: {str(e)}]"
-                
-                # Calculate metrics
-                gen_length = len(generated_text.split())
-                total_length += gen_length
-                
-                # Check for repetition (simple metric: repeated trigrams)
-                words = generated_text.lower().split()
-                trigrams = [' '.join(words[i:i+3]) for i in range(len(words)-2)]
-                unique_trigrams = len(set(trigrams))
-                total_trigrams = len(trigrams)
-                repetition_score = 1 - (unique_trigrams / max(total_trigrams, 1))
-                
-                strategy_results['generations'].append(generated_text)
-                strategy_results['unique_generations'].add(generated_text)
-                strategy_results['repetition_scores'].append(repetition_score)
-                
-                if sample == 0:  # Show first sample
-                    print(f"  → {generated_text}")
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            try:
+                X, Y = get_batch(split, dataset, tokenizer, batch_size, block_size, device)
+                outputs = model(input_ids=X, labels=Y)
+                loss = outputs['loss']
+                losses[k] = loss.item()
+            except Exception as e:
+                print(f"Error in batch {k}: {e}")
+                losses[k] = float('inf')
         
-        # Calculate averages
-        strategy_results['avg_length'] = total_length / len(strategy_results['generations'])
-        strategy_results['avg_repetition'] = sum(strategy_results['repetition_scores']) / len(strategy_results['repetition_scores'])
-        strategy_results['diversity_ratio'] = len(strategy_results['unique_generations']) / len(strategy_results['generations'])
-        
-        results[strategy_name] = strategy_results
+        out[split] = losses.mean().item()
     
-    # Print comparison summary
-    print(f"\n{'='*80}")
-    print("STRATEGY COMPARISON SUMMARY")
-    print(f"{'='*80}")
-    print(f"{'Strategy':<15} {'Avg Length':<12} {'Diversity':<10} {'Repetition':<12} {'Quality Notes'}")
-    print("-" * 80)
-    
-    for strategy_name, result in results.items():
-        avg_len = f"{result['avg_length']:.1f}"
-        diversity = f"{result['diversity_ratio']:.2f}"
-        repetition = f"{result['avg_repetition']:.3f}"
-        
-        # Quality assessment
-        if strategy_name == 'greedy':
-            quality = "Deterministic, may repeat"
-        elif 'top_k_10' in strategy_name:
-            quality = "Conservative, coherent"
-        elif 'top_k_50' in strategy_name:
-            quality = "Balanced creativity"
-        elif 'nucleus_0.7' in strategy_name:
-            quality = "Focused, coherent"
-        elif 'nucleus_0.9' in strategy_name:
-            quality = "Good balance"
-        elif 'nucleus_0.95' in strategy_name:
-            quality = "More diverse"
-        elif 'low_temp' in strategy_name:
-            quality = "Conservative"
-        else:
-            quality = "Creative, may ramble"
-        
-        print(f"{strategy_name:<15} {avg_len:<12} {diversity:<10} {repetition:<12} {quality}")
-    
-    return results
+    model.train()
+    return out
 
-def analyze_generation_quality(generations, tokenizer):
+def train_model_manual(model, dataset, tokenizer, max_iters=1000, eval_interval=100, 
+                       learning_rate=1e-3, batch_size=8, block_size=128, device='cpu'):
     """
-    Analyze quality metrics for generated text
+    Manual training loop inspired by the reference implementation
     
     Args:
-        generations: List of generated texts
-        tokenizer: Tokenizer for analysis
+        model: The model to train
+        dataset: The tokenized dataset
+        tokenizer: The tokenizer
+        max_iters: Maximum training iterations
+        eval_interval: How often to evaluate
+        learning_rate: Learning rate
+        batch_size: Batch size
+        block_size: Sequence length
+        device: Device
+    
+    Returns:
+        dict: Training history with losses
+    """
+    print(f"Starting manual training for {max_iters} iterations...")
+    
+    # Create optimizer like the reference
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    
+    # Track losses
+    train_losses = []
+    eval_losses = []
+    steps = []
+    eval_steps = []
+    
+    for iter in range(max_iters):
+        # Evaluate loss periodically like the reference
+        if iter % eval_interval == 0 or iter == max_iters - 1:
+            losses = estimate_loss_manual(model, dataset, tokenizer, 
+                                        eval_iters=50, batch_size=batch_size, 
+                                        block_size=block_size, device=device)
+            
+            train_loss = losses.get('train', float('inf'))
+            val_loss = losses.get('validation', float('inf'))
+            
+            print(f"step {iter}: train loss {train_loss:.4f}, val loss {val_loss:.4f}")
+            
+            eval_losses.append(val_loss)
+            eval_steps.append(iter)
+        
+        # Sample a batch of data like the reference
+        try:
+            xb, yb = get_batch('train', dataset, tokenizer, batch_size, block_size, device)
+            
+            # Evaluate the loss like the reference
+            outputs = model(input_ids=xb, labels=yb)
+            loss = outputs['loss']
+            
+            # Track training loss at every step
+            train_losses.append(loss.item())
+            steps.append(iter)
+            
+            # Backpropagation like the reference
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            
+        except Exception as e:
+            print(f"Error in training step {iter}: {e}")
+            continue
+    
+    print("Manual training completed!")
+    
+    return {
+        'train_losses': train_losses,
+        'train_steps': steps,
+        'eval_losses': eval_losses,
+        'eval_steps': eval_steps
+    }
+
+# ==================== IMPROVED TRAINING FUNCTIONS ====================
+
+def test_tokenizer_quality(tokenizer, test_texts=None):
+    """
+    Test tokenizer quality and fragmentation
+    
+    Args:
+        tokenizer: The tokenizer to test
+        test_texts: List of test texts (optional)
     
     Returns:
         dict: Quality metrics
     """
-    metrics = {
-        'avg_length': 0,
-        'vocabulary_diversity': 0,
-        'repetition_penalty': 0,
-        'fluency_score': 0
-    }
+    if test_texts is None:
+        test_texts = [
+            "The future of artificial intelligence",
+            "Once upon a time in a distant galaxy",
+            "Neural networks are powerful machine learning models",
+            "Climate change affects global weather patterns",
+            "Programming languages enable software development"
+        ]
     
-    if not generations:
-        return metrics
-    
-    total_words = 0
-    all_words = []
-    total_repetition = 0
-    
-    for text in generations:
-        words = text.lower().split()
-        total_words += len(words)
-        all_words.extend(words)
-        
-        # Calculate repetition (consecutive word repetition)
-        repetitions = sum(1 for i in range(len(words)-1) if words[i] == words[i+1])
-        total_repetition += repetitions / max(len(words), 1)
-    
-    # Calculate metrics
-    metrics['avg_length'] = total_words / len(generations)
-    metrics['vocabulary_diversity'] = len(set(all_words)) / len(all_words) if all_words else 0
-    metrics['repetition_penalty'] = total_repetition / len(generations)
-    
-    # Simple fluency score (based on sentence structure)
-    fluency_scores = []
-    for text in generations:
-        sentences = text.split('.')
-        complete_sentences = sum(1 for s in sentences if len(s.strip().split()) >= 3)
-        fluency_scores.append(complete_sentences / max(len(sentences), 1))
-    
-    metrics['fluency_score'] = sum(fluency_scores) / len(fluency_scores)
-    
-    return metrics
-
-# ==================== EVALUATION FUNCTIONS ====================
-
-def run_generation_analysis():
-    """Run detailed analysis of text generation strategies"""
-    print("=" * 60)
-    print("TEXT GENERATION STRATEGY ANALYSIS")
-    print("=" * 60)
-    
-    # Load a pre-trained model (or train a simple one)
-    print("Setting up model for generation analysis...")
-    model, tokenizer = create_custom_gpt2_model(model_size="tiny")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
-    
-    # For demonstration, you might want to load a pre-trained model here
-    # or use a model that has been trained already
-    
-    print("Analyzing different generation strategies...")
-    generation_results = evaluate_generation_strategies(
-        model=model,
-        tokenizer=tokenizer,
-        prompts=[
-            "The future of AI",
-            "In a world where",
-            "Scientists discovered",
-            "The ancient mystery",
-            "Technology has changed"
-        ],
-        max_length=60,
-        device=device
-    )
-    
-    # Detailed analysis
     print(f"\n{'='*60}")
-    print("DETAILED STRATEGY ANALYSIS")
+    print("TOKENIZER QUALITY TEST")
     print(f"{'='*60}")
     
-    for strategy_name, results in generation_results.items():
-        print(f"\n{strategy_name.upper().replace('_', ' ')}:")
-        print(f"  Average Length: {results['avg_length']:.1f} words")
-        print(f"  Diversity Ratio: {results['diversity_ratio']:.2f}")
-        print(f"  Repetition Score: {results['avg_repetition']:.3f}")
-        
-        # Quality analysis
-        quality_metrics = analyze_generation_quality(results['generations'], tokenizer)
-        print(f"  Vocabulary Diversity: {quality_metrics['vocabulary_diversity']:.3f}")
-        print(f"  Fluency Score: {quality_metrics['fluency_score']:.3f}")
+    results = {
+        'texts': [],
+        'original_lengths': [],
+        'token_counts': [],
+        'fragmentation_scores': [],
+        'examples': []
+    }
     
-    return generation_results
+    for text in test_texts:
+        # Handle different tokenizer types
+        if hasattr(tokenizer, 'encode') and hasattr(tokenizer, 'get_vocab_size'):
+            # Custom BPE tokenizer
+            encoded = tokenizer.encode(text)
+            tokens = encoded.tokens
+            decoded = tokenizer.decode(encoded.ids)
+            token_count = len(encoded.ids)
+        else:
+            # Hugging Face tokenizer
+            encoded = tokenizer.encode(text)
+            tokens = tokenizer.convert_ids_to_tokens(encoded)
+            decoded = tokenizer.decode(encoded)
+            token_count = len(encoded)
+        
+        # Calculate fragmentation score (words vs tokens)
+        words = text.split()
+        fragmentation_score = token_count / len(words) if words else 1.0
+        
+        # Store results
+        results['texts'].append(text)
+        results['original_lengths'].append(len(words))
+        results['token_counts'].append(token_count)
+        results['fragmentation_scores'].append(fragmentation_score)
+        
+        example = {
+            'original': text,
+            'decoded': decoded,
+            'tokens': tokens[:10],  # First 10 tokens
+            'word_count': len(words),
+            'token_count': token_count,
+            'fragmentation': fragmentation_score
+        }
+        results['examples'].append(example)
+        
+        print(f"\nOriginal: '{text}'")
+        print(f"Decoded:  '{decoded}'")
+        print(f"Tokens:   {tokens[:10]}{'...' if len(tokens) > 10 else ''}")
+        print(f"Words: {len(words)}, Tokens: {token_count}, Fragmentation: {fragmentation_score:.2f}")
+    
+    # Calculate overall metrics
+    avg_fragmentation = sum(results['fragmentation_scores']) / len(results['fragmentation_scores'])
+    
+    print(f"\n{'='*60}")
+    print("SUMMARY")
+    print(f"{'='*60}")
+    print(f"Average fragmentation: {avg_fragmentation:.2f}")
+    print(f"Quality assessment: {'Good' if avg_fragmentation < 2.0 else 'Needs improvement'}")
+    
+    if avg_fragmentation > 2.5:
+        print(" High fragmentation detected! Consider:")
+        print("   - Using ByteLevel pre-tokenizer")
+        print("   - Adjusting min_frequency parameter")
+        print("   - Using more training data")
+    
+    return results
 
-def run_loss_curve_analysis():
-    """Run analysis of existing loss curves (useful if you have saved training data)"""
-    print("=" * 60)
-    print("TRAINING LOSS CURVE ANALYSIS")
-    print("=" * 60)
-    
-    # Try to load and analyze existing loss curves
-    loss_file = "./loss_curves.json"
-    
-    if os.path.exists(loss_file):
-        print("Found existing loss curves data. Analyzing...")
-        
-        # Analyze training progress
-        analysis = analyze_training_progress(loss_file)
-        
-        # Plot the curves
-        plot_loss_curves_from_file(loss_file, save_path="./training_analysis.png", show_plot=False)
-        
-        print("\nLoss curve analysis completed!")
-        print("Files generated:")
-        print("  - training_analysis.png (loss curve plot)")
-        print("  - Detailed analysis printed above")
-        
-        return analysis
-    else:
-        print(f"No loss curves file found at {loss_file}")
-        print("Train a model first to generate loss curves.")
-        return None
-
-def create_improved_tokenizer_pipeline():
-    """
-    Create an improved tokenizer pipeline that addresses fragmentation issues
-    """
-    print("\n" + "="*60)
-    print("TOKENIZER IMPROVEMENT PIPELINE")
-    print("="*60)
-    
-    # Option 1: Delete existing tokenizer to force retraining with better params
-    tokenizer_path = "custom_bpe_tokenizer.json"
-    if os.path.exists(tokenizer_path):
-        print("Removing existing tokenizer to retrain with better parameters...")
-        os.remove(tokenizer_path)
-    
-    return True
-
-# ==================== DEBUG FUNCTION ====================
-def debug_loss_curves():
-    """Debug function to check what's in the loss curves file"""
+def debug_loss_curves(loss_file="./loss_curves.json"):
+    """Debug what's actually saved in the loss curves file"""
     try:
-        with open("./loss_curves.json", 'r') as f:
+        import json
+        with open(loss_file, 'r') as f:
             loss_data = json.load(f)
         
-        print("\n" + "="*50)
-        print("DEBUG: LOSS CURVES DATA")
-        print("="*50)
-        print(f"Train losses: {len(loss_data.get('train_losses', []))} entries")
-        print(f"Train steps: {len(loss_data.get('train_steps', []))} entries")
-        print(f"Eval losses: {len(loss_data.get('eval_losses', []))} entries")
-        print(f"Eval steps: {len(loss_data.get('eval_steps', []))} entries")
+        print(f"\n{'='*50}")
+        print("LOSS CURVES DEBUG")
+        print(f"{'='*50}")
         
-        if loss_data.get('train_losses'):
-            print(f"Train losses sample: {loss_data['train_losses'][:5]}")
-        if loss_data.get('eval_losses'):
-            print(f"Eval losses sample: {loss_data['eval_losses'][:5]}")
+        for key, value in loss_data.items():
+            if isinstance(value, list):
+                print(f"{key}: {len(value)} entries")
+                if value:
+                    print(f"  First: {value[0]}")
+                    print(f"  Last: {value[-1]}")
+                    print(f"  Sample: {value[:3]}")
+                else:
+                    print(f"  Empty list!")
+            else:
+                print(f"{key}: {value}")
         
         return loss_data
+        
+    except FileNotFoundError:
+        print(f"Loss curves file not found: {loss_file}")
+        return None
     except Exception as e:
         print(f"Error reading loss curves: {e}")
         return None
 
-# ==================== RUN TRAINING ====================
-if __name__ == "__main__":
-    # Choose what to run
-    RUN_TRAINING = True
-    RUN_MODEL_COMPARISON = False  # Set to True to compare model sizes
-    RUN_GENERATION_ANALYSIS = False  # Set to True to analyze generation strategies
-    RUN_LOSS_ANALYSIS = False  # Set to True to analyze existing loss curves
+# ==================== MAIN FUNCTIONS WITH FIXES ====================
+
+def train_with_better_loss_tracking(model, tokenizer, train_dataset, eval_dataset=None, 
+                                   use_manual_training=False, test_mode=True):
+    """
+    Enhanced training with better loss tracking options
     
-    if RUN_TRAINING:
-        main_training_pipeline()
+    Args:
+        model: The model to train
+        tokenizer: The tokenizer
+        train_dataset: Training dataset
+        eval_dataset: Evaluation dataset
+        use_manual_training: If True, use manual training loop like reference
+        test_mode: If True, use test mode settings
     
-    if RUN_MODEL_COMPARISON:
-        run_model_comparison()
+    Returns:
+        dict: Training results with loss curves
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
     
-    if RUN_GENERATION_ANALYSIS:
-        run_generation_analysis()
-    
-    if RUN_LOSS_ANALYSIS:
-        run_loss_curve_analysis()
+    if use_manual_training:
+        print("Using manual training loop (reference style) for better loss tracking...")
+        
+        # Convert dataset to proper format for manual training
+        tokenized_data = {
+            'train': train_dataset,
+            'validation': eval_dataset if eval_dataset else train_dataset
+        }
+        
+        # Training parameters
+        max_iters = 100 if test_mode else 1000
+        eval_interval = 20 if test_mode else 100
+        batch_size = 4 if test_mode else 8
+        block_size = 128
+        learning_rate = 1e-3 if test_mode else 5e-4
+        
+        # Manual training
+        results = train_model_manual(
+            model=model,
+            dataset=tokenized_data,
+            tokenizer=tokenizer,
+            max_iters=max_iters,
+            eval_interval=eval_interval,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+            block_size=block_size,
+            device=device
+        )
+        
+        # Save results
+        import json
+        with open('./loss_curves.json', 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        # Plot results
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(12, 6))
+        
+        if results['train_losses'] and results['train_steps']:
+            plt.plot(results['train_steps'], results['train_losses'], 'b-', label='Training Loss', linewidth=2)
+        
+        if results['eval_losses'] and results['eval_steps']:
+            plt.plot(results['eval_steps'], results['eval_losses'], 'r-', label='Validation Loss', linewidth=2, marker='o')
+        
+        plt.xlabel('Training Steps')
+        plt.ylabel('Loss')
+        plt.title('Training and Validation Loss Curves (Manual Training)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig('./training_loss_curve.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print("Loss curves saved to loss_curves.json and training_loss_curve.png")
+        
+        return results
+        
+    else:
+        print("Using improved CustomTrainer with fixed loss tracking...")
+        
+        # Use the improved CustomTrainer
+        trainer = train_custom_model(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            test_mode=test_mode
+        )
+        
+        return trainer
+
+# ==================== UPDATED MAIN PIPELINE ====================
