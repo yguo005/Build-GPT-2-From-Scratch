@@ -23,6 +23,7 @@ from tokenizers.processors import TemplateProcessing
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import time
+import pandas as pd
 
 # =============================================================================
 # 1. HYPERPARAMETERS (GPT-2 Standard Configurations)
@@ -119,20 +120,21 @@ class BPETokenizer:
 # =============================================================================
 
 def load_and_prepare_dataset():
-    """Load WikiText-2 dataset from local files and prepare for training"""
-    print("Loading WikiText-2 dataset from local files...")
+    """Load dataset from local parquet files and prepare for training"""
+    print("Loading dataset from local parquet files...")
 
-    train_path = "wiki.train.txt"
-    val_path = "wiki.valid.txt"
-    test_path = "wiki.test.txt"
+    train_path = "train-00000-of-00001.parquet"
+    val_path = "validation-00000-of-00001.parquet"
+    test_path = "test-00000-of-00001.parquet"
 
-    def read_file(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return [line.strip() for line in f if line.strip()]
+    def read_parquet(path):
+        df = pd.read_parquet(path)
+        # If the column is not named 'text', print(df.columns) to check
+        return [str(x).strip() for x in df['text'] if str(x).strip()]
 
-    train_texts = read_file(train_path)
-    val_texts = read_file(val_path)
-    test_texts = read_file(test_path)
+    train_texts = read_parquet(train_path)
+    val_texts = read_parquet(val_path)
+    test_texts = read_parquet(test_path)
 
     print(f"Train texts: {len(train_texts)}")
     print(f"Validation texts: {len(val_texts)}")
