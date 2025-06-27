@@ -250,11 +250,11 @@ class FeedForward(nn.Module):
 class TransformerBlock(nn.Module):
     """Transformer block with pre-layer normalization"""
     
-    def __init__(self, n_embd, n_head, block_size, dropout=0.1):
+    def __init__(self, n_embd, n_head, block_size, dropout=0.1, bias=True):
         super().__init__()
-        self.ln1 = nn.LayerNorm(n_embd, bias=config['bias'])
+        self.ln1 = nn.LayerNorm(n_embd, bias=bias)
         self.attn = MultiHeadAttention(n_embd, n_head, block_size, dropout)
-        self.ln2 = nn.LayerNorm(n_embd, bias=config['bias'])
+        self.ln2 = nn.LayerNorm(n_embd, bias=bias)
         self.ffwd = FeedForward(n_embd, dropout)
 
     def forward(self, x):
@@ -280,7 +280,8 @@ class GPT2Model(nn.Module):
                 config['n_embd'], 
                 config['n_head'], 
                 config['block_size'], 
-                config['dropout']
+                config['dropout'],
+                config['bias']         # <-- add this argument
             ) for _ in range(config['n_layer'])
         ])
         
