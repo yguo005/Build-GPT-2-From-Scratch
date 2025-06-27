@@ -447,7 +447,7 @@ def train_model():
     )
     
     # Initialize gradient scaler for mixed precision
-    scaler = torch.amp.GradScaler(device_type='cuda')
+    scaler = torch.amp.GradScaler()
     
     # Training loop
     train_losses = []
