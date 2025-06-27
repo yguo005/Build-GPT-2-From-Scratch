@@ -115,25 +115,29 @@ class BPETokenizer:
         self.tokenizer = Tokenizer.from_file(path)
 
 # =============================================================================
-# 3. DATASET LOADING AND PREPROCESSING
+# 3. DATASET LOADING AND PREPROCESSING (LOCAL FILES)
 # =============================================================================
 
 def load_and_prepare_dataset():
-    """Load Wikitext-2 dataset and prepare for training"""
-    print("Loading Wikitext-2 dataset...")
-    
-    # Load dataset
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
-    
-    # Combine all text
-    train_texts = [text for text in dataset['train']['text'] if text.strip()]
-    val_texts = [text for text in dataset['validation']['text'] if text.strip()]
-    test_texts = [text for text in dataset['test']['text'] if text.strip()]
-    
+    """Load WikiText-2 dataset from local files and prepare for training"""
+    print("Loading WikiText-2 dataset from local files...")
+
+    train_path = "wiki.train.txt"
+    val_path = "wiki.valid.txt"
+    test_path = "wiki.test.txt"
+
+    def read_file(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return [line.strip() for line in f if line.strip()]
+
+    train_texts = read_file(train_path)
+    val_texts = read_file(val_path)
+    test_texts = read_file(test_path)
+
     print(f"Train texts: {len(train_texts)}")
     print(f"Validation texts: {len(val_texts)}")
     print(f"Test texts: {len(test_texts)}")
-    
+
     return train_texts, val_texts, test_texts
 
 def prepare_data(texts, tokenizer, block_size):
