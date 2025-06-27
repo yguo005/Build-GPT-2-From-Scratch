@@ -331,43 +331,47 @@ class GPT2Model(nn.Module):
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
         """
         Generate text with different sampling strategies:
-        - Greedy decoding (temperature=0)
+        - Greedy decoding (temperature=0 or very low)
         - Top-k sampling
         - Nucleus (top-p) sampling
         """
         for _ in range(max_new_tokens):
-            # Crop idx to the last block_size tokens
+            # Crop idx to the last block_size tokens if needed
             idx_cond = idx if idx.size(1) <= self.config['block_size'] else idx[:, -self.config['block_size']:]
             
             # Forward pass
             logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] / temperature  # (B, vocab_size)
             
-            # Apply top-k filtering
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
+            # Get logits for the last token
+            logits = logits[:, -1, :] / temperature
             
-            # Apply nucleus (top-p) filtering
-            if top_p is not None:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                
-                # Remove tokens with cumulative probability above the threshold
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
-                
-                # Scatter sorted tensors to original indexing
-                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                logits[indices_to_remove] = -float('Inf')
-            
-            # Sample from the distribution
-            probs = F.softmax(logits, dim=-1)
-            if temperature == 0:
+            # Apply sampling strategy
+            if temperature == 0 or temperature < 1e-8:
                 # Greedy decoding
-                idx_next = torch.argmax(probs, dim=-1, keepdim=True)
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
             else:
+                # Apply top-k filtering
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('inf')
+                
+                # Apply nucleus (top-p) filtering
+                if top_p is not None:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    
+                    # Remove tokens with cumulative probability above the threshold
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    # Shift the indices to the right to keep also the first token above the threshold
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    
+                    # Scatter sorted tensors back to original indexing
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    logits[indices_to_remove] = -float('inf')
+                
+                # Sample from the filtered distribution
+                probs = F.softmax(logits, dim=-1)
                 idx_next = torch.multinomial(probs, num_samples=1)
             
             # Append sampled index to the running sequence
