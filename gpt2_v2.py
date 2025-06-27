@@ -64,7 +64,7 @@ print(f"Using device: {TRAIN_CONFIG['device']}")
 CONFIGS = {
     'gpt2_nano': {
         'vocab_size': 50257,
-        'block_size': 128,
+        'block_size': 128, #sequence length
         'n_embd': 384,
         'n_head': 6,
         'n_layer': 6,
@@ -494,7 +494,7 @@ def train_model():
     
     # Train tokenizer
     tokenizer = BPETokenizer(vocab_size=32000)
-    tokenizer.train_tokenizer(train_texts[:1000])  # Use subset for faster training
+    tokenizer.train_tokenizer(train_texts[:1000]) 
     
     # Update config with actual vocab size
     CONFIG['vocab_size'] = tokenizer.tokenizer.get_vocab_size()
@@ -701,11 +701,11 @@ def compare_model_sizes():
     
     results_comparison = {}
     
-    # Reduced training iterations for comparison (to save time)
+    # remain same config as TRAIN_CONFIG for comparison
     comparison_train_config = TRAIN_CONFIG.copy()
-    comparison_train_config['max_iters'] = 200  # Shorter training for comparison
-    comparison_train_config['eval_interval'] = 200
-    comparison_train_config['eval_iters'] = 50
+    comparison_train_config['max_iters'] = 5000  
+    comparison_train_config['eval_interval'] = 500
+    comparison_train_config['eval_iters'] = 200
     
     for model_name, config in CONFIGS.items():
         print(f"\n{'='*60}")
@@ -716,7 +716,7 @@ def compare_model_sizes():
         config['vocab_size'] = tokenizer.tokenizer.get_vocab_size()
         
         # Prepare data
-        train_data = prepare_data(train_texts[:500], tokenizer, config['block_size'])  # Use subset for faster comparison
+        train_data = prepare_data(train_texts[:1000], tokenizer, config['block_size'])  # Use subset for faster comparison
         val_data = prepare_data(val_texts[:100], tokenizer, config['block_size'])
         test_data = prepare_data(test_texts[:100], tokenizer, config['block_size'])
         
