@@ -369,7 +369,7 @@ def estimate_loss(model, train_data, val_data, eval_iters, batch_size, block_siz
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(data, batch_size, block_size, device)
-            with torch.cuda.amp.autocast():
+            with torch.cuda.amp.autocast('cuda'):
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
@@ -385,7 +385,7 @@ def calculate_perplexity(model, data, batch_size, block_size, device):
     with torch.no_grad():
         for i in range(0, len(data) - batch_size, batch_size):
             X, Y = get_batch(data, batch_size, block_size, device)
-            with torch.cuda.amp.autocast():
+            with torch.cuda.amp.autocast('cuda'):
                 logits, loss = model(X, Y)
             total_loss += loss.item()
             num_batches += 1
@@ -509,7 +509,7 @@ def train_model():
         for micro_step in range(TRAIN_CONFIG['gradient_accumulation_steps']):
             X, Y = get_batch(train_data, TRAIN_CONFIG['batch_size'], CONFIG['block_size'], TRAIN_CONFIG['device'])
             
-            with torch.cuda.amp.autocast():
+            with torch.cuda.amp.autocast('cuda'):
                 logits, loss = model(X, Y)
                 loss = loss / TRAIN_CONFIG['gradient_accumulation_steps']  # Scale loss
             
@@ -573,9 +573,9 @@ def train_model():
     
     # Save final results
     results = {
-        'test_perplexity': test_perplexity,
-        'train_losses': train_losses,
-        'val_losses': val_losses,
+        'test_perplexity': float(test_perplexity),
+        'train_losses': [float(x) for x in train_losses],
+        'val_losses': [float(x) for x in val_losses],
         'config': CONFIG,
         'train_config': TRAIN_CONFIG,
         'generated_samples': {

@@ -30,7 +30,7 @@ attn_mask parameter).
 (c) Feedforward layers. Implement two linear layers with a GELU non-linearity.
 (d) Layer normalization and residual connections. Apply pre-layer normalization be-
 fore attention and feedforward layers, as in GPT-2.
-1
+
 5. Model hyperparameters:
 (a) Define hyperparameters for the model size, number of layers, embedding dimension,
 number of attention heads, and hidden layer size.
