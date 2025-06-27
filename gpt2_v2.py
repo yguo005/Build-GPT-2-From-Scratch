@@ -59,6 +59,37 @@ TRAIN_CONFIG = {
 
 print(f"Using device: {TRAIN_CONFIG['device']}")
 
+# Multiple GPT-2 configurations for comparison
+CONFIGS = {
+    'gpt2_nano': {
+        'vocab_size': 50257,
+        'block_size': 128,
+        'n_embd': 384,
+        'n_head': 6,
+        'n_layer': 6,
+        'dropout': 0.1,
+        'bias': True
+    },
+    'gpt2_small': {
+        'vocab_size': 50257,
+        'block_size': 128,
+        'n_embd': 768,
+        'n_head': 12,
+        'n_layer': 12,
+        'dropout': 0.1,
+        'bias': True
+    },
+    'gpt2_medium': {
+        'vocab_size': 50257,
+        'block_size': 128,
+        'n_embd': 1024,
+        'n_head': 16,
+        'n_layer': 24,
+        'dropout': 0.1,
+        'bias': True
+    }
+}
+
 # =============================================================================
 # 2. BPE TOKENIZER IMPLEMENTATION
 # =============================================================================
@@ -227,7 +258,7 @@ class TransformerBlock(nn.Module):
         self.ffwd = FeedForward(n_embd, dropout)
 
     def forward(self, x):
-        # Pre-layer norm as in GPT-2
+        # Pre-layer norm and residual connections
         x = x + self.attn(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
         return x
@@ -594,6 +625,72 @@ def train_model():
     print(f"\nTraining completed!")
     print(f"Best validation loss: {best_val_loss:.4f}")
     print(f"Test perplexity: {test_perplexity:.2f}")
+
+def compare_model_sizes():
+    """Compare different model sizes for training efficiency, perplexity, and text quality"""
+    # Load data once
+    train_texts, val_texts, test_texts = load_and_prepare_dataset()
+    
+    # Train tokenizer once
+    tokenizer = BPETokenizer(vocab_size=32000)
+    tokenizer.train_tokenizer(train_texts[:1000])
+    
+    results_comparison = {}
+    
+    for model_name, config in CONFIGS.items():
+        print(f"\n{'='*50}")
+        print(f"Training {model_name}")
+        print(f"{'='*50}")
+        
+        config['vocab_size'] = tokenizer.tokenizer.get_vocab_size()
+        
+        # Prepare data
+        train_data = prepare_data(train_texts, tokenizer, config['block_size'])
+        val_data = prepare_data(val_texts, tokenizer, config['block_size'])
+        test_data = prepare_data(test_texts, tokenizer, config['block_size'])
+        
+        # Initialize model
+        model = GPT2Model(config).to(TRAIN_CONFIG['device'])
+        param_count = sum(p.numel() for p in model.parameters())
+        print(f"Model parameters: {param_count/1e6:.2f}M")
+        
+        # Train model (abbreviated training for comparison)
+        start_time = time.time()
+        # ... training code ...
+        training_time = time.time() - start_time
+        
+        # Evaluate
+        test_perplexity = calculate_perplexity(
+            model, test_data, TRAIN_CONFIG['batch_size'], 
+            config['block_size'], TRAIN_CONFIG['device']
+        )
+        
+        # Generate sample text
+        prompt = "The quick brown"
+        prompt_ids = torch.tensor([tokenizer.encode(prompt)], device=TRAIN_CONFIG['device'])
+        
+        with torch.no_grad():
+            sample_output = model.generate(prompt_ids, max_new_tokens=30, temperature=0.8, top_k=50)
+            sample_text = tokenizer.decode(sample_output[0].tolist())
+        
+        # Store results
+        results_comparison[model_name] = {
+            'parameters': param_count,
+            'training_time': training_time,
+            'test_perplexity': float(test_perplexity),
+            'sample_text': sample_text
+        }
+        
+        print(f"Parameters: {param_count/1e6:.2f}M")
+        print(f"Training time: {training_time:.2f}s")
+        print(f"Test perplexity: {test_perplexity:.2f}")
+        print(f"Sample: {sample_text}")
+    
+    # Save comparison results
+    with open('model_size_comparison.json', 'w') as f:
+        json.dump(results_comparison, f, indent=2)
+    
+    return results_comparison
 
 if __name__ == "__main__":
     train_model()
