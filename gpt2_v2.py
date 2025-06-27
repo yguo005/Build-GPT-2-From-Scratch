@@ -443,6 +443,43 @@ def get_lr(it, warmup_iters, lr_decay_iters, learning_rate, min_lr):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
+
+
+def analyze_sampling_strategies(model, tokenizer, prompts, device):
+    """Analyze how different sampling strategies affect fluency and diversity"""
+    results = {}
+    
+    for prompt in prompts:
+        prompt_ids = torch.tensor([tokenizer.encode(prompt)], device=device)
+        results[prompt] = {}
+        
+        # Generate multiple samples for each strategy
+        strategies = {
+            'greedy': {'temperature': 0},
+            'top_k': {'temperature': 0.8, 'top_k': 50},
+            'nucleus': {'temperature': 0.8, 'top_p': 0.9}
+        }
+        
+        for strategy_name, params in strategies.items():
+            samples = []
+            for _ in range(5):  # Generate 5 samples for diversity analysis
+                with torch.no_grad():
+                    output = model.generate(prompt_ids, max_new_tokens=30, **params)
+                    text = tokenizer.decode(output[0].tolist())
+                    samples.append(text)
+            
+            results[prompt][strategy_name] = samples
+            
+            # Calculate diversity metrics
+            unique_samples = len(set(samples))
+            diversity_ratio = unique_samples / len(samples)
+            
+            print(f"\n{strategy_name.upper()} - Prompt: '{prompt}'")
+            print(f"Diversity: {diversity_ratio:.2f} ({unique_samples}/5 unique)")
+            for i, sample in enumerate(samples[:3]):  # Show first 3 samples
+                print(f"  Sample {i+1}: {sample}")
+    
+    return results
 # =============================================================================
 # 6. MAIN TRAINING FUNCTION
 # =============================================================================
@@ -654,7 +691,7 @@ def compare_model_sizes():
     
     # Reduced training iterations for comparison (to save time)
     comparison_train_config = TRAIN_CONFIG.copy()
-    comparison_train_config['max_iters'] = 1000  # Shorter training for comparison
+    comparison_train_config['max_iters'] = 200  # Shorter training for comparison
     comparison_train_config['eval_interval'] = 200
     comparison_train_config['eval_iters'] = 50
     
