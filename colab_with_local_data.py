@@ -462,14 +462,18 @@ def train_custom_bpe_tokenizer(dataset, vocab_size=32000, save_path="custom_bpe_
     """
     print(f"Training custom BPE tokenizer with vocab size {vocab_size}...")
     
-    # Initialize BPE tokenizer
+    # Initialize BPE tokenizer with better configuration
     tokenizer = Tokenizer(BPE(unk_token="<|endoftext|>"))
     tokenizer.pre_tokenizer = Whitespace()
     
-    # Configure trainer with vocabulary size
+    # Configure trainer with vocabulary size and better parameters
     trainer = BpeTrainer(
         vocab_size=vocab_size,
-        special_tokens=["<|endoftext|>", "<|pad|>"]
+        special_tokens=["<|endoftext|>", "<|pad|>"],
+        min_frequency=2,  # Require minimum frequency for merges
+        show_progress=True,
+        continuing_subword_prefix="##",  # Use subword prefix like BERT
+        end_of_word_suffix="</w>"  # Mark end of words to prevent over-splitting
     )
     
     # Prepare training data
@@ -598,15 +602,18 @@ class CustomTrainer(Trainer):
         else:
             super().log(logs)
         
-        # Capture training loss
-        if "train_loss" in logs:
-            self.train_losses.append(logs["train_loss"])
+        # Capture training loss - check multiple possible keys
+        train_loss = logs.get("train_loss") or logs.get("loss")
+        if train_loss is not None:
+            self.train_losses.append(train_loss)
             self.train_steps.append(self.state.global_step)
+            print(f"[DEBUG] Captured training loss: {train_loss} at step {self.state.global_step}")
         
         # Capture evaluation loss
         if "eval_loss" in logs:
             self.eval_losses.append(logs["eval_loss"])
             self.eval_steps.append(self.state.global_step)
+            print(f"[DEBUG] Captured eval loss: {logs['eval_loss']} at step {self.state.global_step}")
     
     def get_loss_curves(self):
         """Return training and validation loss curves"""
@@ -884,12 +891,13 @@ def train_custom_model(model, tokenizer, train_dataset, eval_dataset=None, test_
             per_device_eval_batch_size=4,
             gradient_accumulation_steps=4,
             warmup_steps=500,
-            logging_steps=50,  # Reduced from 100 to log training loss more frequently
+            logging_steps=50,  # More frequent logging to capture training loss
+            logging_strategy="steps",
             save_steps=1000,
-            eval_steps=1000 if eval_dataset else None,
+            eval_steps=500 if eval_dataset else None,  # More frequent evaluation
             eval_strategy="steps" if eval_dataset else "no",
             save_total_limit=2,
-            prediction_loss_only=True,
+            prediction_loss_only=False,  # Changed to False to get more detailed logs
             remove_unused_columns=False,
             dataloader_pin_memory=False,
             fp16=torch.cuda.is_available(),
@@ -903,6 +911,8 @@ def train_custom_model(model, tokenizer, train_dataset, eval_dataset=None, test_
             lr_scheduler_type="cosine",
             report_to=[],  # Disable all external logging (wandb, tensorboard, etc.)
             run_name=None,  # Explicitly set to None to avoid wandb confusion
+            load_best_model_at_end=True if eval_dataset else False,  # Load best model
+            metric_for_best_model="eval_loss" if eval_dataset else None,
         )
     
     # Initialize custom trainer
@@ -1247,6 +1257,9 @@ def main_training_pipeline():
     print("\nLoading WikiText data...")
     dataset = load_wikitext_from_local_files(test_mode=TEST_MODE)
     
+    # Improve tokenizer pipeline
+    create_improved_tokenizer_pipeline()
+    
     # Create custom model with BPE tokenizer as required
     print(f"\nCreating custom {recommended_size} model with BPE tokenizer...")
     
@@ -1283,6 +1296,7 @@ def main_training_pipeline():
     
     # Analyze training progress from loss curves
     print(f"\nAnalyzing training progress...")
+    debug_loss_curves()  # Debug what's actually in the file
     training_analysis = analyze_training_progress("./loss_curves.json")
     
     # Evaluate different generation strategies
@@ -1642,6 +1656,47 @@ def run_loss_curve_analysis():
     else:
         print(f"No loss curves file found at {loss_file}")
         print("Train a model first to generate loss curves.")
+        return None
+
+def create_improved_tokenizer_pipeline():
+    """
+    Create an improved tokenizer pipeline that addresses fragmentation issues
+    """
+    print("\n" + "="*60)
+    print("TOKENIZER IMPROVEMENT PIPELINE")
+    print("="*60)
+    
+    # Option 1: Delete existing tokenizer to force retraining with better params
+    tokenizer_path = "custom_bpe_tokenizer.json"
+    if os.path.exists(tokenizer_path):
+        print("Removing existing tokenizer to retrain with better parameters...")
+        os.remove(tokenizer_path)
+    
+    return True
+
+# ==================== DEBUG FUNCTION ====================
+def debug_loss_curves():
+    """Debug function to check what's in the loss curves file"""
+    try:
+        with open("./loss_curves.json", 'r') as f:
+            loss_data = json.load(f)
+        
+        print("\n" + "="*50)
+        print("DEBUG: LOSS CURVES DATA")
+        print("="*50)
+        print(f"Train losses: {len(loss_data.get('train_losses', []))} entries")
+        print(f"Train steps: {len(loss_data.get('train_steps', []))} entries")
+        print(f"Eval losses: {len(loss_data.get('eval_losses', []))} entries")
+        print(f"Eval steps: {len(loss_data.get('eval_steps', []))} entries")
+        
+        if loss_data.get('train_losses'):
+            print(f"Train losses sample: {loss_data['train_losses'][:5]}")
+        if loss_data.get('eval_losses'):
+            print(f"Eval losses sample: {loss_data['eval_losses'][:5]}")
+        
+        return loss_data
+    except Exception as e:
+        print(f"Error reading loss curves: {e}")
         return None
 
 # ==================== RUN TRAINING ====================
