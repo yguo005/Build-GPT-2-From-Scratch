@@ -884,7 +884,7 @@ def train_custom_model(model, tokenizer, train_dataset, eval_dataset=None, test_
             per_device_eval_batch_size=4,
             gradient_accumulation_steps=4,
             warmup_steps=500,
-            logging_steps=100,
+            logging_steps=50,  # Reduced from 100 to log training loss more frequently
             save_steps=1000,
             eval_steps=1000 if eval_dataset else None,
             eval_strategy="steps" if eval_dataset else "no",
@@ -931,11 +931,11 @@ def train_custom_model(model, tokenizer, train_dataset, eval_dataset=None, test_
 @torch.no_grad()
 def estimate_loss(model, tokenized_datasets, tokenizer, eval_iters=100, batch_size=8):
     """
-    Estimate loss on training and validation sets
+    Estimate loss on all available dataset splits
     
     Args:
         model: The trained model
-        tokenized_datasets: Dict with 'train' and 'validation' datasets
+        tokenized_datasets: Dict with dataset splits (train/validation/test)
         tokenizer: The tokenizer used
         eval_iters: Number of batches to evaluate
         batch_size: Batch size for evaluation
@@ -945,11 +945,20 @@ def estimate_loss(model, tokenized_datasets, tokenizer, eval_iters=100, batch_si
     
     results = {}
     
-    for split in ['train', 'validation']:
+    # Handle all available splits, not just train/validation
+    available_splits = ['train', 'validation', 'test']
+    for split in available_splits:
         if split not in tokenized_datasets:
             continue
             
         dataset = tokenized_datasets[split]
+        
+        # Check if dataset is empty
+        if len(dataset) == 0:
+            print(f"Warning: {split} dataset is empty, setting loss to inf")
+            results[split] = float('inf')
+            continue
+            
         losses = []
         
         # Create dataloader for evaluation
