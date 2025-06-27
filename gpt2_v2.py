@@ -252,9 +252,9 @@ class TransformerBlock(nn.Module):
     
     def __init__(self, n_embd, n_head, block_size, dropout=0.1):
         super().__init__()
-        self.ln1 = nn.LayerNorm(n_embd, bias=CONFIG['bias'])
+        self.ln1 = nn.LayerNorm(n_embd, bias=config['bias'])
         self.attn = MultiHeadAttention(n_embd, n_head, block_size, dropout)
-        self.ln2 = nn.LayerNorm(n_embd, bias=CONFIG['bias'])
+        self.ln2 = nn.LayerNorm(n_embd, bias=config['bias'])
         self.ffwd = FeedForward(n_embd, dropout)
 
     def forward(self, x):
@@ -641,6 +641,8 @@ def train_model():
 
 def compare_model_sizes():
     """Compare different model sizes for training efficiency, perplexity, and text quality"""
+    print("Starting model size comparison experiment...")
+    
     # Load data once
     train_texts, val_texts, test_texts = load_and_prepare_dataset()
     
@@ -650,72 +652,111 @@ def compare_model_sizes():
     
     results_comparison = {}
     
+    # Reduced training iterations for comparison (to save time)
+    comparison_train_config = TRAIN_CONFIG.copy()
+    comparison_train_config['max_iters'] = 1000  # Shorter training for comparison
+    comparison_train_config['eval_interval'] = 200
+    comparison_train_config['eval_iters'] = 50
+    
     for model_name, config in CONFIGS.items():
-        print(f"\n{'='*50}")
-        print(f"Training {model_name}")
-        print(f"{'='*50}")
+        print(f"\n{'='*60}")
+        print(f"Training {model_name.upper()}")
+        print(f"{'='*60}")
         
+        # Update vocab size
         config['vocab_size'] = tokenizer.tokenizer.get_vocab_size()
         
         # Prepare data
-        train_data = prepare_data(train_texts, tokenizer, config['block_size'])
-        val_data = prepare_data(val_texts, tokenizer, config['block_size'])
-        test_data = prepare_data(test_texts, tokenizer, config['block_size'])
+        train_data = prepare_data(train_texts[:500], tokenizer, config['block_size'])  # Use subset for faster comparison
+        val_data = prepare_data(val_texts[:100], tokenizer, config['block_size'])
+        test_data = prepare_data(test_texts[:100], tokenizer, config['block_size'])
         
         # Initialize model
         model = GPT2Model(config).to(TRAIN_CONFIG['device'])
         param_count = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {param_count/1e6:.2f}M")
         
-        # Train model (abbreviated training for comparison)
-        start_time = time.time()
-        # ... training code ...
-        training_time = time.time() - start_time
+        # Initialize optimizer
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=comparison_train_config['learning_rate'],
+            weight_decay=comparison_train_config['weight_decay']
+        )
         
-        # Evaluate
+        # Initialize gradient scaler
+        scaler = torch.amp.GradScaler()
+        
+        # Training metrics
+        train_losses = []
+        val_losses = []
+        training_times = []
+        
+        print("Starting training...")
+        start_time = time.time()
+        
+        # Training loop
+        for iter_num in range(comparison_train_config['max_iters']):
+            # Update learning rate
+            lr = get_lr(
+                iter_num, 
+                comparison_train_config['warmup_iters'], 
+                comparison_train_config['lr_decay_iters'], 
+                comparison_train_config['learning_rate'], 
+                comparison_train_config['min_lr']
+            )
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+            
+            # Evaluate periodically
+            if iter_num % comparison_train_config['eval_interval'] == 0 or iter_num == comparison_train_config['max_iters'] - 1:
+                losses = estimate_loss(
+                    model, train_data, val_data, 
+                    comparison_train_config['eval_iters'], 
+                    comparison_train_config['batch_size'], 
+                    config['block_size'], 
+                    TRAIN_CONFIG['device']
+                )
+                train_losses.append(losses['train'])
+                val_losses.append(losses['val'])
+                current_time = time.time() - start_time
+                training_times.append(current_time)
+                
+                print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, time {current_time:.1f}s")
+            
+            # Training step
+            optimizer.zero_grad()
+            for micro_step in range(comparison_train_config['gradient_accumulation_steps']):
+                X, Y = get_batch(train_data, comparison_train_config['batch_size'], config['block_size'], TRAIN_CONFIG['device'])
+                
+                with torch.amp.autocast(device_type='cuda'):
+                    logits, loss = model(X, Y)
+                    loss = loss / comparison_train_config['gradient_accumulation_steps']
+                
+                scaler.scale(loss).backward()
+            
+            # Gradient clipping and optimizer step
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        
+        total_training_time = time.time() - start_time
+        
+        # Final evaluation
+        print(f"\nEvaluating {model_name}...")
+        
+        # Calculate test perplexity
         test_perplexity = calculate_perplexity(
-            model, test_data, TRAIN_CONFIG['batch_size'], 
+            model, test_data, comparison_train_config['batch_size'], 
             config['block_size'], TRAIN_CONFIG['device']
         )
         
-        # Generate sample text
+        # Generate sample texts for quality assessment
+        model.eval()
         prompt = "The quick brown"
         prompt_ids = torch.tensor([tokenizer.encode(prompt)], device=TRAIN_CONFIG['device'])
         
-        with torch.no_grad():
-            sample_output = model.generate(prompt_ids, max_new_tokens=30, temperature=0.8, top_k=50)
-            sample_text = tokenizer.decode(sample_output[0].tolist())
-        
-        # Store results
-        results_comparison[model_name] = {
-            'parameters': param_count,
-            'training_time': training_time,
-            'test_perplexity': float(test_perplexity),
-            'sample_text': sample_text
-        }
-        
-        print(f"Parameters: {param_count/1e6:.2f}M")
-        print(f"Training time: {training_time:.2f}s")
-        print(f"Test perplexity: {test_perplexity:.2f}")
-        print(f"Sample: {sample_text}")
-    
-    # Save comparison results
-    with open('model_size_comparison.json', 'w') as f:
-        json.dump(results_comparison, f, indent=2)
-    
-    return results_comparison
-
-
-# Analyze sampling strategies
-def analyze_sampling_strategies(model, tokenizer, prompts, device):
-    """Analyze how different sampling strategies affect fluency and diversity"""
-    results = {}
-    
-    for prompt in prompts:
-        prompt_ids = torch.tensor([tokenizer.encode(prompt)], device=device)
-        results[prompt] = {}
-        
-        # Generate multiple samples for each strategy
+        sample_texts = {}
         strategies = {
             'greedy': {'temperature': 0},
             'top_k': {'temperature': 0.8, 'top_k': 50},
@@ -723,30 +764,155 @@ def analyze_sampling_strategies(model, tokenizer, prompts, device):
         }
         
         for strategy_name, params in strategies.items():
-            samples = []
-            for _ in range(5):  # Generate 5 samples for diversity analysis
-                with torch.no_grad():
-                    output = model.generate(prompt_ids, max_new_tokens=30, **params)
-                    text = tokenizer.decode(output[0].tolist())
-                    samples.append(text)
-            
-            results[prompt][strategy_name] = samples
-            
-            # Calculate diversity metrics
-            unique_samples = len(set(samples))
-            diversity_ratio = unique_samples / len(samples)
-            
-            print(f"\n{strategy_name.upper()} - Prompt: '{prompt}'")
-            print(f"Diversity: {diversity_ratio:.2f} ({unique_samples}/5 unique)")
-            for i, sample in enumerate(samples[:3]):  # Show first 3 samples
-                print(f"  Sample {i+1}: {sample}")
+            with torch.no_grad():
+                output = model.generate(prompt_ids, max_new_tokens=30, **params)
+                text = tokenizer.decode(output[0].tolist())
+                sample_texts[strategy_name] = text
+        
+        # Calculate training efficiency metrics
+        tokens_per_second = (len(train_data) * config['block_size'] * comparison_train_config['max_iters']) / total_training_time
+        
+        # Store results
+        results_comparison[model_name] = {
+            'parameters': param_count,
+            'parameters_millions': param_count / 1e6,
+            'total_training_time': total_training_time,
+            'training_time_per_iter': total_training_time / comparison_train_config['max_iters'],
+            'tokens_per_second': tokens_per_second,
+            'final_train_loss': float(train_losses[-1]),
+            'final_val_loss': float(val_losses[-1]),
+            'test_perplexity': float(test_perplexity),
+            'train_losses': [float(x) for x in train_losses],
+            'val_losses': [float(x) for x in val_losses],
+            'training_times': training_times,
+            'sample_texts': sample_texts,
+            'config': config
+        }
+        
+        # Print summary
+        print(f"\n{model_name.upper()} RESULTS:")
+        print(f"Parameters: {param_count/1e6:.2f}M")
+        print(f"Training time: {total_training_time:.1f}s")
+        print(f"Time per iteration: {total_training_time/comparison_train_config['max_iters']:.3f}s")
+        print(f"Tokens/second: {tokens_per_second:.0f}")
+        print(f"Final train loss: {train_losses[-1]:.4f}")
+        print(f"Final val loss: {val_losses[-1]:.4f}")
+        print(f"Test perplexity: {test_perplexity:.2f}")
+        print(f"Sample (greedy): {sample_texts['greedy'][:80]}...")
     
-    return results
+    # Create comparison visualizations
+    create_comparison_plots(results_comparison)
+    
+    # Save detailed comparison results
+    with open('model_size_comparison.json', 'w') as f:
+        json.dump(results_comparison, f, indent=2)
+    
+    # Print comparison summary
+    print_comparison_summary(results_comparison)
+    
+    return results_comparison
 
+def create_comparison_plots(results):
+    """Create visualization plots for model comparison"""
+    model_names = list(results.keys())
+    
+    # Extract metrics
+    params = [results[name]['parameters_millions'] for name in model_names]
+    train_times = [results[name]['total_training_time'] for name in model_names]
+    perplexities = [results[name]['test_perplexity'] for name in model_names]
+    final_losses = [results[name]['final_val_loss'] for name in model_names]
+    tokens_per_sec = [results[name]['tokens_per_second'] for name in model_names]
+    
+    # Create subplots
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # Plot 1: Parameters vs Training Time
+    ax1.scatter(params, train_times, s=100, alpha=0.7)
+    for i, name in enumerate(model_names):
+        ax1.annotate(name.replace('gpt2_', ''), (params[i], train_times[i]), 
+                    xytext=(5, 5), textcoords='offset points')
+    ax1.set_xlabel('Parameters (Millions)')
+    ax1.set_ylabel('Training Time (seconds)')
+    ax1.set_title('Training Efficiency: Parameters vs Time')
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Parameters vs Perplexity
+    ax2.scatter(params, perplexities, s=100, alpha=0.7, color='orange')
+    for i, name in enumerate(model_names):
+        ax2.annotate(name.replace('gpt2_', ''), (params[i], perplexities[i]), 
+                    xytext=(5, 5), textcoords='offset points')
+    ax2.set_xlabel('Parameters (Millions)')
+    ax2.set_ylabel('Test Perplexity')
+    ax2.set_title('Model Size vs Performance')
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Training Curves Comparison
+    for name in model_names:
+        steps = list(range(0, len(results[name]['val_losses']) * 200, 200))
+        ax3.plot(steps, results[name]['val_losses'], label=f"{name.replace('gpt2_', '')} val", marker='o', markersize=3)
+    ax3.set_xlabel('Training Steps')
+    ax3.set_ylabel('Validation Loss')
+    ax3.set_title('Training Curves Comparison')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Efficiency Bar Chart
+    x_pos = range(len(model_names))
+    bars = ax4.bar(x_pos, tokens_per_sec, alpha=0.7, color='green')
+    ax4.set_xlabel('Model Size')
+    ax4.set_ylabel('Tokens/Second')
+    ax4.set_title('Training Throughput Comparison')
+    ax4.set_xticks(x_pos)
+    ax4.set_xticklabels([name.replace('gpt2_', '') for name in model_names])
+    
+    # Add value labels on bars
+    for bar, value in zip(bars, tokens_per_sec):
+        ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 10,
+                f'{value:.0f}', ha='center', va='bottom')
+    
+    plt.tight_layout()
+    plt.savefig('model_size_comparison.png', dpi=300, bbox_inches='tight')
+    plt.show()
 
+def print_comparison_summary(results):
+    """Print a formatted comparison summary"""
+    print(f"\n{'='*80}")
+    print("MODEL SIZE COMPARISON SUMMARY")
+    print(f"{'='*80}")
+    
+    print(f"{'Model':<12} {'Params(M)':<10} {'Time(s)':<10} {'Perplexity':<12} {'Val Loss':<10} {'Tokens/s':<10}")
+    print("-" * 80)
+    
+    for name, data in results.items():
+        print(f"{name.replace('gpt2_', ''):<12} "
+              f"{data['parameters_millions']:<10.1f} "
+              f"{data['total_training_time']:<10.1f} "
+              f"{data['test_perplexity']:<12.2f} "
+              f"{data['final_val_loss']:<10.4f} "
+              f"{data['tokens_per_second']:<10.0f}")
+    
+    print("\n" + "="*80)
+    print("KEY INSIGHTS:")
+    
+    # Find best performing models
+    best_perplexity = min(results.values(), key=lambda x: x['test_perplexity'])
+    fastest_training = min(results.values(), key=lambda x: x['total_training_time'])
+    most_efficient = max(results.values(), key=lambda x: x['tokens_per_second'])
+    
+    print(f"• Best Perplexity: {[k for k, v in results.items() if v == best_perplexity][0]} ({best_perplexity['test_perplexity']:.2f})")
+    print(f"• Fastest Training: {[k for k, v in results.items() if v == fastest_training][0]} ({fastest_training['total_training_time']:.1f}s)")
+    print(f"• Highest Throughput: {[k for k, v in results.items() if v == most_efficient][0]} ({most_efficient['tokens_per_second']:.0f} tokens/s)")
+
+# Update the main execution
 if __name__ == "__main__":
-    
+    # Run single model training
     train_model()
     
-    
-   
+    # Run model size comparison
+    print("\n" + "="*60)
+    print("STARTING MODEL SIZE COMPARISON")
+    print("="*60)
+    compare_model_sizes()
+
+
+
