@@ -696,5 +696,49 @@ def compare_model_sizes():
     
     return results_comparison
 
-if __name__ == "__main__":
-    train_model()
+
+# Analyze sampling strategies
+def analyze_sampling_strategies(model, tokenizer, prompts, device):
+    """Analyze how different sampling strategies affect fluency and diversity"""
+    results = {}
+    
+    for prompt in prompts:
+        prompt_ids = torch.tensor([tokenizer.encode(prompt)], device=device)
+        results[prompt] = {}
+        
+        # Generate multiple samples for each strategy
+        strategies = {
+            'greedy': {'temperature': 0},
+            'top_k_conservative': {'temperature': 0.7, 'top_k': 10},
+            'top_k_diverse': {'temperature': 0.8, 'top_k': 50},
+            'nucleus_conservative': {'temperature': 0.7, 'top_p': 0.7},
+            'nucleus_diverse': {'temperature': 0.8, 'top_p': 0.9}
+        }
+        
+        for strategy_name, params in strategies.items():
+            samples = []
+            for _ in range(5):  # Generate 5 samples for diversity analysis
+                with torch.no_grad():
+                    output = model.generate(prompt_ids, max_new_tokens=30, **params)
+                    text = tokenizer.decode(output[0].tolist())
+                    samples.append(text)
+            
+            results[prompt][strategy_name] = samples
+            
+            # Calculate diversity metrics
+            unique_samples = len(set(samples))
+            diversity_ratio = unique_samples / len(samples)
+            
+            print(f"\n{strategy_name.upper()} - Prompt: '{prompt}'")
+            print(f"Diversity: {diversity_ratio:.2f} ({unique_samples}/5 unique)")
+            for i, sample in enumerate(samples[:3]):  # Show first 3 samples
+                print(f"  Sample {i+1}: {sample}")
+    
+    return results
+
+
+sampling_analysis = analyze_sampling_strategies(
+    model, tokenizer, 
+    ["The quick brown", "In the future", "Once upon a time"],
+    TRAIN_CONFIG['device']
+)
