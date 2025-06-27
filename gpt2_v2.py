@@ -593,6 +593,14 @@ def train_model():
         nucleus_text = tokenizer.decode(nucleus_output[0].tolist())
         print(f"\nNucleus (p=0.9): {nucleus_text}")
     
+    # Add sampling strategy analysis 
+    print("\nAnalyzing sampling strategies...")
+    sampling_analysis = analyze_sampling_strategies(
+        model, tokenizer, 
+        ["The quick brown", "In the future", "Once upon a time"],
+        TRAIN_CONFIG['device']
+    )
+    
     # Plot training curves
     plt.figure(figsize=(10, 6))
     steps = list(range(0, len(train_losses) * TRAIN_CONFIG['eval_interval'], TRAIN_CONFIG['eval_interval']))
@@ -606,7 +614,7 @@ def train_model():
     plt.savefig('training_curves.png')
     plt.show()
     
-    # Save final results
+    # Save final results (update to include sampling analysis)
     results = {
         'test_perplexity': float(test_perplexity),
         'train_losses': [float(x) for x in train_losses],
@@ -617,7 +625,8 @@ def train_model():
             'greedy': greedy_text,
             'top_k': topk_text,
             'nucleus': nucleus_text
-        }
+        },
+        'sampling_analysis': sampling_analysis  # Add this line
     }
     
     with open('training_results.json', 'w') as f:
@@ -709,10 +718,8 @@ def analyze_sampling_strategies(model, tokenizer, prompts, device):
         # Generate multiple samples for each strategy
         strategies = {
             'greedy': {'temperature': 0},
-            'top_k_conservative': {'temperature': 0.7, 'top_k': 10},
-            'top_k_diverse': {'temperature': 0.8, 'top_k': 50},
-            'nucleus_conservative': {'temperature': 0.7, 'top_p': 0.7},
-            'nucleus_diverse': {'temperature': 0.8, 'top_p': 0.9}
+            'top_k': {'temperature': 0.8, 'top_k': 50},
+            'nucleus': {'temperature': 0.8, 'top_p': 0.9}
         }
         
         for strategy_name, params in strategies.items():
@@ -737,8 +744,9 @@ def analyze_sampling_strategies(model, tokenizer, prompts, device):
     return results
 
 
-sampling_analysis = analyze_sampling_strategies(
-    model, tokenizer, 
-    ["The quick brown", "In the future", "Once upon a time"],
-    TRAIN_CONFIG['device']
-)
+if __name__ == "__main__":
+    
+    train_model()
+    
+    
+   
