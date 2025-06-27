@@ -6,11 +6,18 @@ GPT-2 Training in Google Colab with Local WikiText Data
 # ==================== IMPORTS ====================
 import os
 import sys
+
+# Disable wandb logging completely
+os.environ["WANDB_DISABLED"] = "true"
+os.environ["WANDB_MODE"] = "disabled"
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 import pandas as pd
+import matplotlib.pyplot as plt
+import json
 from datasets import Dataset, DatasetDict
 from transformers import (
     AutoTokenizer,
@@ -33,6 +40,35 @@ class CustomTransformerConfig:
         self.n_layer = n_layer         # number of transformer layers
         self.n_head = n_head           # number of attention heads
         self.n_inner = n_inner         # feedforward inner dimension
+    
+    def to_dict(self):
+        """Convert config to dictionary for Hugging Face compatibility"""
+        return {
+            'vocab_size': self.vocab_size,
+            'n_positions': self.n_positions,
+            'n_embd': self.n_embd,
+            'n_layer': self.n_layer,
+            'n_head': self.n_head,
+            'n_inner': self.n_inner,
+            'model_type': 'custom_gpt2'
+        }
+    
+    def to_json_string(self):
+        """Convert config to JSON string for Hugging Face compatibility"""
+        import json
+        return json.dumps(self.to_dict(), indent=2)
+    
+    @classmethod
+    def from_dict(cls, config_dict):
+        """Create config from dictionary for Hugging Face compatibility"""
+        return cls(
+            vocab_size=config_dict.get('vocab_size', 50257),
+            n_positions=config_dict.get('n_positions', 1024),
+            n_embd=config_dict.get('n_embd', 768),
+            n_layer=config_dict.get('n_layer', 12),
+            n_head=config_dict.get('n_head', 12),
+            n_inner=config_dict.get('n_inner', 3072)
+        )
 
 class MultiHeadMaskedSelfAttention(nn.Module):
     """
@@ -127,6 +163,7 @@ class CustomGPT2Model(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = False  # Add gradient checkpointing support
         
         # (a) Token and position embeddings with learned position embeddings
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
@@ -156,6 +193,30 @@ class CustomGPT2Model(nn.Module):
             torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight)
     
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for memory efficiency"""
+        self.gradient_checkpointing = True
+    
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing"""
+        self.gradient_checkpointing = False
+    
+    def get_input_embeddings(self):
+        """Get input embeddings for compatibility with Hugging Face"""
+        return self.token_embedding
+    
+    def set_input_embeddings(self, new_embeddings):
+        """Set input embeddings for compatibility with Hugging Face"""
+        self.token_embedding = new_embeddings
+    
+    def get_output_embeddings(self):
+        """Get output embeddings for compatibility with Hugging Face"""
+        return self.lm_head
+    
+    def set_output_embeddings(self, new_embeddings):
+        """Set output embeddings for compatibility with Hugging Face"""
+        self.lm_head = new_embeddings
+    
     def forward(self, input_ids, labels=None):
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
@@ -170,7 +231,11 @@ class CustomGPT2Model(nn.Module):
         
         # Pass through transformer blocks
         for block in self.transformer_blocks:
-            hidden_states = block(hidden_states)
+            if self.gradient_checkpointing and self.training:
+                # Use gradient checkpointing during training for memory efficiency
+                hidden_states = torch.utils.checkpoint.checkpoint(block, hidden_states, use_reentrant=False)
+            else:
+                hidden_states = block(hidden_states)
         
         # Final layer norm and output projection
         hidden_states = self.ln_final(hidden_states)
@@ -220,6 +285,81 @@ class CustomGPT2Model(nn.Module):
                     break
         
         return input_ids
+    
+    def generate_with_strategies(self, input_ids, max_length=50, temperature=1.0, 
+                             strategy='greedy', top_k=50, top_p=0.9, pad_token_id=None):
+        """
+        Advanced generation with multiple decoding strategies
+        
+        Args:
+            input_ids: Input token IDs
+            max_length: Maximum sequence length
+            temperature: Temperature for sampling (higher = more random)
+            strategy: 'greedy', 'top_k', 'nucleus' (top_p), or 'random'
+            top_k: Number of top tokens to consider for top-k sampling
+            top_p: Cumulative probability threshold for nucleus sampling
+            pad_token_id: Padding token ID
+        
+        Returns:
+            Generated token IDs
+        """
+        self.eval()
+        device = input_ids.device
+        
+        with torch.no_grad():
+            for _ in range(max_length - input_ids.size(1)):
+                outputs = self.forward(input_ids)
+                logits = outputs['logits']
+                
+                # Get next token logits and apply temperature
+                next_token_logits = logits[:, -1, :] / temperature
+                
+                if strategy == 'greedy':
+                    # Greedy decoding: Always select highest probability token
+                    next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                
+                elif strategy == 'top_k':
+                    # Top-k sampling: Limit choices to top k tokens
+                    top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
+                    probs = F.softmax(top_k_logits, dim=-1)
+                    next_token_idx = torch.multinomial(probs, num_samples=1)
+                    next_token = top_k_indices.gather(-1, next_token_idx)
+                
+                elif strategy == 'nucleus' or strategy == 'top_p':
+                    # Nucleus (top-p) sampling: Sample from smallest set with cumulative prob > p
+                    sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    
+                    # Remove tokens with cumulative probability above the threshold
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    # Shift the indices to the right to keep also the first token above the threshold
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    
+                    # Set logits to -inf for tokens to remove
+                    sorted_logits[sorted_indices_to_remove] = float('-inf')
+                    
+                    # Sample from the filtered distribution
+                    probs = F.softmax(sorted_logits, dim=-1)
+                    next_token_idx = torch.multinomial(probs, num_samples=1)
+                    next_token = sorted_indices.gather(-1, next_token_idx)
+                
+                elif strategy == 'random':
+                    # Random sampling from full distribution
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                
+                else:
+                    raise ValueError(f"Unknown strategy: {strategy}")
+                
+                # Append the new token
+                input_ids = torch.cat([input_ids, next_token], dim=-1)
+                
+                # Stop if we hit pad token
+                if pad_token_id is not None and next_token.item() == pad_token_id:
+                    break
+        
+        return input_ids
 
 # ==================== DATA LOADING FUNCTIONS ====================
 
@@ -257,83 +397,6 @@ def load_wikitext_from_local_files(test_mode=False):
     
     return dataset
 
-# ==================== TRAINING FUNCTIONS ====================
-def setup_training_environment():
-    """Setup optimal environment for training"""
-    
-    # Check GPU
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
-        print(f"GPU: {gpu_name} ({gpu_memory:.1f} GB)")
-        
-        # Optimize for GPU type
-        if "T4" in gpu_name:
-            print("Optimizing for T4 GPU")
-            return "small"  # Recommend small model for T4
-        else:
-            return "tiny"   # Conservative for other GPUs
-    else:
-        print("[WARNING] No GPU detected - training will be slow")
-        return "tiny"
-
-def create_custom_gpt2_model(model_size="tiny"):
-    """Create custom GPT-2 model with specified size"""
-    
-    tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    if model_size == "small":  # GPT-2 Small (117M)
-        config = CustomTransformerConfig(
-            vocab_size=tokenizer.vocab_size,
-            n_positions=1024, n_embd=768, n_layer=12, n_head=12, n_inner=3072
-        )
-    elif model_size == "medium":  # GPT-2 Medium (345M)
-        config = CustomTransformerConfig(
-            vocab_size=tokenizer.vocab_size,
-            n_positions=1024, n_embd=1024, n_layer=24, n_head=16, n_inner=4096
-        )
-    elif model_size == "large":  # GPT-2 Large (762M)
-        config = CustomTransformerConfig(
-            vocab_size=tokenizer.vocab_size,
-            n_positions=1024, n_embd=1280, n_layer=36, n_head=20, n_inner=5120
-        )
-    elif model_size == "xl":  # GPT-2 XL (1.5B)
-        config = CustomTransformerConfig(
-            vocab_size=tokenizer.vocab_size,
-            n_positions=1024, n_embd=1600, n_layer=48, n_head=25, n_inner=6400
-        )
-    else:  # tiny (for testing)
-        config = CustomTransformerConfig(
-            vocab_size=tokenizer.vocab_size,
-            n_positions=256, n_embd=128, n_layer=2, n_head=4, n_inner=512
-        )
-    
-    model = CustomGPT2Model(config)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"[OK] Custom model created: {total_params:,} parameters (~{total_params * 4 / (1024**2):.1f} MB)")
-    
-    return model, tokenizer
-
-# ==================== CUSTOM TRAINER FOR CUSTOM MODEL ====================
-
-class CustomTrainer(Trainer):
-    """Custom trainer to work with our custom model"""
-    
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """Compute loss using our custom model's forward method"""
-        input_ids = inputs.get("input_ids")
-        labels = inputs.get("labels", input_ids)
-        
-        outputs = model(input_ids=input_ids, labels=labels)
-        loss = outputs['loss']
-        
-        return (loss, outputs) if return_outputs else loss
-
 def tokenize_dataset(dataset, tokenizer, max_length=256):
     """Tokenize dataset for training"""
     
@@ -342,135 +405,54 @@ def tokenize_dataset(dataset, tokenizer, max_length=256):
         if not texts:
             return {'input_ids': [], 'attention_mask': []}
         
-        return tokenizer(
-            texts,
-            truncation=True,
-            padding='max_length',
-            max_length=max_length,
-            return_tensors=None
-        )
+        # Check if it's a custom BPE tokenizer (from tokenizers library)
+        if hasattr(tokenizer, 'encode') and hasattr(tokenizer, 'get_vocab_size'):
+            # Custom BPE tokenizer
+            encodings = []
+            attention_masks = []
+            
+            for text in texts:
+                encoded = tokenizer.encode(text)
+                tokens = encoded.ids[:max_length]
+                
+                # Pad to max_length
+                if len(tokens) < max_length:
+                    attention_mask = [1] * len(tokens) + [0] * (max_length - len(tokens))
+                    tokens = tokens + [0] * (max_length - len(tokens))  # Use 0 for padding
+                else:
+                    attention_mask = [1] * max_length
+                
+                encodings.append(tokens)
+                attention_masks.append(attention_mask)
+            
+            return {
+                'input_ids': encodings,
+                'attention_mask': attention_masks
+            }
+        else:
+            # Hugging Face tokenizer
+            return tokenizer(
+                texts,
+                truncation=True,
+                padding='max_length',
+                max_length=max_length,
+                return_tensors=None
+            )
     
     # Tokenize with progress bar
     tokenized_dataset = {}
-    for split in ['train', 'validation']:
-        print(f"Tokenizing {split}...")
-        tokenized_dataset[split] = dataset[split].map(
-            tokenize_function,
-            batched=True,
-            remove_columns=['text'],
-            num_proc=1,  # Single process for stability
-            desc=f"Tokenizing {split}"
-        )
+    for split in ['train', 'validation', 'test']:
+        if split in dataset:
+            print(f"Tokenizing {split}...")
+            tokenized_dataset[split] = dataset[split].map(
+                tokenize_function,
+                batched=True,
+                remove_columns=['text'],
+                num_proc=1,  # Single process for stability
+                desc=f"Tokenizing {split}"
+            )
     
     return tokenized_dataset
-
-def train_custom_model(model, tokenizer, train_dataset, eval_dataset, test_mode=True):
-    """Train custom model with all specified requirements"""
-    
-    # Calculate total training steps for scheduler
-    total_steps = len(train_dataset) // (8 * 2) * 1  # batch_size * grad_accum * epochs
-    warmup_steps = int(0.1 * total_steps)  # 10% warmup
-    
-    # Training arguments with all requirements
-    if test_mode:
-        training_args = TrainingArguments(
-            output_dir="./custom-gpt2-model",
-            overwrite_output_dir=True,
-            num_train_epochs=1,
-            
-            # ✓ Choose batch size that fits GPU memory (8 or 16)
-            per_device_train_batch_size=8,
-            per_device_eval_batch_size=8,
-            
-            # ✓ Use gradient accumulation to simulate larger batches
-            gradient_accumulation_steps=2,  # Effective batch size = 8 * 2 = 16
-            
-            # ✓ Learning rate scheduling: warmup + cosine decay
-            warmup_steps=warmup_steps,
-            lr_scheduler_type="cosine",  # Cosine decay after warmup
-            learning_rate=5e-5,
-            
-            # ✓ AdamW optimizer with weight decay
-            optim="adamw_torch",
-            weight_decay=0.01,
-            
-            # ✓ Report loss at regular intervals
-            logging_steps=10,  # Every X gradient updates
-            eval_steps=50,
-            eval_strategy="steps",
-            
-            # ✓ Model checkpointing
-            save_steps=100,
-            save_total_limit=3,  # Keep last 3 checkpoints
-            
-            prediction_loss_only=True,
-            fp16=True,
-            dataloader_pin_memory=False,
-            remove_unused_columns=False,
-            report_to=[],
-        )
-    else:
-        # Full training configuration
-        total_steps = len(train_dataset) // (16 * 4) * 2  # batch_size * grad_accum * epochs
-        warmup_steps = int(0.1 * total_steps)
-        
-        training_args = TrainingArguments(
-            output_dir="./custom-gpt2-model",
-            overwrite_output_dir=True,
-            num_train_epochs=2,
-            
-            # ✓ Larger batch size for full training
-            per_device_train_batch_size=16,
-            per_device_eval_batch_size=16,
-            
-            # ✓ Gradient accumulation
-            gradient_accumulation_steps=4,  # Effective batch size = 16 * 4 = 64
-            
-            # ✓ Learning rate scheduling
-            warmup_steps=warmup_steps,
-            lr_scheduler_type="cosine",
-            learning_rate=3e-5,
-            
-            # ✓ AdamW with weight decay
-            optim="adamw_torch",
-            weight_decay=0.01,
-            
-            # ✓ Regular reporting and checkpointing
-            logging_steps=50,
-            eval_steps=200,
-            eval_strategy="steps",
-            save_steps=500,
-            save_total_limit=3,
-            
-            prediction_loss_only=True,
-            fp16=True,
-            dataloader_pin_memory=False,
-            remove_unused_columns=False,
-            report_to=[],
-        )
-    
-    # Data collator
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False,
-        pad_to_multiple_of=8
-    )
-    
-    # Custom Trainer
-    trainer = CustomTrainer(
-        model=model,
-        args=training_args,
-        data_collator=data_collator,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-    )
-    
-    print("Starting training...")
-    trainer.train()
-    trainer.save_model()
-    
-    print("[OK] Training completed! Model saved to ./custom-gpt2-model")
-    return trainer
 
 def train_custom_bpe_tokenizer(dataset, vocab_size=32000, save_path="custom_bpe_tokenizer"):
     """
@@ -493,7 +475,7 @@ def train_custom_bpe_tokenizer(dataset, vocab_size=32000, save_path="custom_bpe_
     # Prepare training data
     def batch_iterator():
         for example in dataset:
-            if example['text'].strip():
+            if example['text'].strip():  # Skip empty texts
                 yield example['text']
     
     # Train the tokenizer on dataset
@@ -504,6 +486,445 @@ def train_custom_bpe_tokenizer(dataset, vocab_size=32000, save_path="custom_bpe_
     print(f"[OK] Custom BPE tokenizer saved to {save_path}.json")
     
     return tokenizer
+
+def setup_training_environment():
+    """Setup optimal environment for training"""
+    
+    # Check GPU
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"GPU: {gpu_name} ({gpu_memory:.1f} GB)")
+        
+        # Optimize for GPU type
+        if "T4" in gpu_name:
+            print("Optimizing for T4 GPU")
+            return "small"  # Recommend small model for T4
+        else:
+            return "tiny"   # Conservative for other GPUs
+    else:
+        print("[WARNING] No GPU detected - training will be slow")
+        return "tiny"
+
+def create_custom_gpt2_model(model_size="tiny", use_custom_tokenizer=False, dataset=None):
+    """Create custom GPT-2 model with specified size and tokenizer"""
+    
+    if use_custom_tokenizer and dataset is not None:
+        # Train custom BPE tokenizer as required
+        print("Training custom BPE tokenizer as per requirements...")
+        tokenizer_path = "custom_bpe_tokenizer"
+        
+        if not os.path.exists(f"{tokenizer_path}.json"):
+            custom_tokenizer = train_custom_bpe_tokenizer(
+                dataset['train'], 
+                vocab_size=32000,  # Requirement: 32,000 tokens
+                save_path=tokenizer_path
+            )
+        else:
+            print(f"Loading existing custom tokenizer from {tokenizer_path}.json")
+            custom_tokenizer = Tokenizer.from_file(f"{tokenizer_path}.json")
+        
+        vocab_size = custom_tokenizer.get_vocab_size()
+        tokenizer = custom_tokenizer
+    else:
+        # Fallback to pre-trained GPT-2 tokenizer
+        tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        vocab_size = tokenizer.vocab_size
+    
+    if model_size == "small":  # GPT-2 Small (117M)
+        config = CustomTransformerConfig(
+            vocab_size=vocab_size,
+            n_positions=1024, n_embd=768, n_layer=12, n_head=12, n_inner=3072
+        )
+    elif model_size == "medium":  # GPT-2 Medium (345M)
+        config = CustomTransformerConfig(
+            vocab_size=vocab_size,
+            n_positions=1024, n_embd=1024, n_layer=24, n_head=16, n_inner=4096
+        )
+    elif model_size == "large":  # GPT-2 Large (762M)
+        config = CustomTransformerConfig(
+            vocab_size=vocab_size,
+            n_positions=1024, n_embd=1280, n_layer=36, n_head=20, n_inner=5120
+        )
+    elif model_size == "xl":  # GPT-2 XL (1.5B)
+        config = CustomTransformerConfig(
+            vocab_size=vocab_size,
+            n_positions=1024, n_embd=1600, n_layer=48, n_head=25, n_inner=6400
+        )
+    else:  # tiny (for testing)
+        config = CustomTransformerConfig(
+            vocab_size=vocab_size,
+            n_positions=256, n_embd=128, n_layer=2, n_head=4, n_inner=512
+        )
+    
+    model = CustomGPT2Model(config)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"[OK] Custom model created: {total_params:,} parameters (~{total_params * 4 / (1024**2):.1f} MB)")
+    
+    return model, tokenizer
+
+# ==================== CUSTOM TRAINER FOR CUSTOM MODEL ====================
+
+class CustomTrainer(Trainer):
+    """Custom trainer to work with our custom model and track loss curves"""
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.train_losses = []
+        self.eval_losses = []
+        self.train_steps = []
+        self.eval_steps = []
+    
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """Compute loss using our custom model's forward method"""
+        input_ids = inputs.get("input_ids")
+        labels = inputs.get("labels", input_ids)
+        
+        outputs = model(input_ids=input_ids, labels=labels)
+        loss = outputs['loss']
+        
+        return (loss, outputs) if return_outputs else loss
+    
+    def log(self, logs, start_time=None):
+        """Override log method to capture training loss"""
+        # Call parent method with proper arguments
+        if start_time is not None:
+            super().log(logs, start_time)
+        else:
+            super().log(logs)
+        
+        # Capture training loss
+        if "train_loss" in logs:
+            self.train_losses.append(logs["train_loss"])
+            self.train_steps.append(self.state.global_step)
+        
+        # Capture evaluation loss
+        if "eval_loss" in logs:
+            self.eval_losses.append(logs["eval_loss"])
+            self.eval_steps.append(self.state.global_step)
+    
+    def get_loss_curves(self):
+        """Return training and validation loss curves"""
+        return {
+            'train_losses': self.train_losses,
+            'train_steps': self.train_steps,
+            'eval_losses': self.eval_losses,
+            'eval_steps': self.eval_steps
+        }
+    
+    def save_loss_curves(self, save_path="./loss_curves.json"):
+        """Save loss curves to JSON file"""
+        loss_data = self.get_loss_curves()
+        with open(save_path, 'w') as f:
+            json.dump(loss_data, f, indent=2)
+        print(f"Loss curves saved to {save_path}")
+    
+    def plot_loss_curves(self, save_path="./training_loss_curve.png", show_plot=True):
+        """Plot and save training loss curves"""
+        plt.figure(figsize=(12, 6))
+        
+        # Plot training loss
+        if self.train_losses and self.train_steps:
+            plt.plot(self.train_steps, self.train_losses, 'b-', label='Training Loss', linewidth=2)
+        
+        # Plot validation loss
+        if self.eval_losses and self.eval_steps:
+            plt.plot(self.eval_steps, self.eval_losses, 'r-', label='Validation Loss', linewidth=2, marker='o', markersize=4)
+        
+        plt.xlabel('Training Steps')
+        plt.ylabel('Loss')
+        plt.title('Training and Validation Loss Curves')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Add some styling
+        plt.tight_layout()
+        
+        # Save the plot
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Loss curve plot saved to {save_path}")
+        
+        if show_plot:
+            plt.show()
+        else:
+            plt.close()
+        
+        return save_path
+
+def plot_loss_curves_from_file(loss_file="./loss_curves.json", save_path="./training_loss_curve.png", show_plot=True):
+    """
+    Load and plot loss curves from saved JSON file
+    
+    Args:
+        loss_file: Path to the saved loss curves JSON file
+        save_path: Path to save the plot
+        show_plot: Whether to display the plot
+    
+    Returns:
+        str: Path to saved plot
+    """
+    try:
+        with open(loss_file, 'r') as f:
+            loss_data = json.load(f)
+        
+        plt.figure(figsize=(12, 6))
+        
+        # Plot training loss
+        if loss_data.get('train_losses') and loss_data.get('train_steps'):
+            plt.plot(loss_data['train_steps'], loss_data['train_losses'], 
+                    'b-', label='Training Loss', linewidth=2)
+        
+        # Plot validation loss
+        if loss_data.get('eval_losses') and loss_data.get('eval_steps'):
+            plt.plot(loss_data['eval_steps'], loss_data['eval_losses'], 
+                    'r-', label='Validation Loss', linewidth=2, marker='o', markersize=4)
+        
+        plt.xlabel('Training Steps')
+        plt.ylabel('Loss')
+        plt.title('Training and Validation Loss Curves')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        # Save the plot
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Loss curve plot saved to {save_path}")
+        
+        if show_plot:
+            plt.show()
+        else:
+            plt.close()
+        
+        return save_path
+        
+    except FileNotFoundError:
+        print(f"Loss curves file not found: {loss_file}")
+        return None
+    except Exception as e:
+        print(f"Error plotting loss curves: {e}")
+        return None
+
+def analyze_training_progress(loss_file="./loss_curves.json"):
+    """
+    Analyze training progress from loss curves
+    
+    Args:
+        loss_file: Path to the saved loss curves JSON file
+    
+    Returns:
+        dict: Analysis results
+    """
+    try:
+        with open(loss_file, 'r') as f:
+            loss_data = json.load(f)
+        
+        analysis = {}
+        
+        # Analyze training loss
+        if loss_data.get('train_losses'):
+            train_losses = loss_data['train_losses']
+            analysis['train_loss_start'] = train_losses[0] if train_losses else None
+            analysis['train_loss_end'] = train_losses[-1] if train_losses else None
+            analysis['train_loss_reduction'] = (train_losses[0] - train_losses[-1]) if len(train_losses) > 1 else 0
+            analysis['train_loss_reduction_pct'] = (analysis['train_loss_reduction'] / train_losses[0] * 100) if train_losses[0] > 0 else 0
+        
+        # Analyze validation loss
+        if loss_data.get('eval_losses'):
+            eval_losses = loss_data['eval_losses']
+            analysis['eval_loss_start'] = eval_losses[0] if eval_losses else None
+            analysis['eval_loss_end'] = eval_losses[-1] if eval_losses else None
+            analysis['eval_loss_reduction'] = (eval_losses[0] - eval_losses[-1]) if len(eval_losses) > 1 else 0
+            analysis['eval_loss_reduction_pct'] = (analysis['eval_loss_reduction'] / eval_losses[0] * 100) if eval_losses[0] > 0 else 0
+            
+            # Check for overfitting (validation loss starts increasing)
+            if len(eval_losses) >= 3:
+                recent_trend = eval_losses[-3:]
+                analysis['potential_overfitting'] = recent_trend[-1] > min(recent_trend)
+            else:
+                analysis['potential_overfitting'] = False
+        
+        # Training stability
+        if loss_data.get('train_losses') and len(loss_data['train_losses']) > 10:
+            recent_losses = loss_data['train_losses'][-10:]
+            loss_variance = sum((x - sum(recent_losses)/len(recent_losses))**2 for x in recent_losses) / len(recent_losses)
+            analysis['training_stability'] = 'stable' if loss_variance < 0.01 else 'unstable'
+        
+        # Print analysis
+        print(f"\n{'='*50}")
+        print("TRAINING PROGRESS ANALYSIS")
+        print(f"{'='*50}")
+        
+        if 'train_loss_start' in analysis:
+            print(f"Training Loss: {analysis['train_loss_start']:.4f} → {analysis['train_loss_end']:.4f}")
+            print(f"Training Loss Reduction: {analysis['train_loss_reduction']:.4f} ({analysis['train_loss_reduction_pct']:.1f}%)")
+        
+        if 'eval_loss_start' in analysis:
+            print(f"Validation Loss: {analysis['eval_loss_start']:.4f} → {analysis['eval_loss_end']:.4f}")
+            print(f"Validation Loss Reduction: {analysis['eval_loss_reduction']:.4f} ({analysis['eval_loss_reduction_pct']:.1f}%)")
+        
+        if 'potential_overfitting' in analysis:
+            if analysis['potential_overfitting']:
+                print("⚠️  Potential overfitting detected (validation loss trending upward)")
+            else:
+                print("✅ No obvious overfitting detected")
+        
+        if 'training_stability' in analysis:
+            print(f"Training Stability: {analysis['training_stability']}")
+        
+        return analysis
+        
+    except FileNotFoundError:
+        print(f"Loss curves file not found: {loss_file}")
+        return {}
+    except Exception as e:
+        print(f"Error analyzing training progress: {e}")
+        return {}
+
+def train_custom_model(model, tokenizer, train_dataset, eval_dataset=None, test_mode=True):
+    """
+    Train custom model with proper data collator handling for both tokenizer types
+    
+    Args:
+        model: The custom GPT-2 model to train
+        tokenizer: Either Hugging Face tokenizer or custom BPE tokenizer
+        train_dataset: Training dataset
+        eval_dataset: Evaluation dataset (optional)
+        test_mode: Whether to use test mode (faster training)
+    
+    Returns:
+        CustomTrainer: The trained model trainer
+    """
+    print("Setting up training configuration...")
+    
+    # Custom data collator for BPE tokenizers
+    class CustomDataCollator:
+        def __init__(self, pad_token_id=0):
+            self.pad_token_id = pad_token_id
+        
+        def __call__(self, batch):
+            # Handle both input_ids and labels
+            input_ids = [item['input_ids'] for item in batch]
+            
+            # Find maximum length in batch
+            max_len = max(len(ids) for ids in input_ids)
+            
+            # Pad sequences
+            padded_input_ids = []
+            attention_masks = []
+            
+            for ids in input_ids:
+                padding_length = max_len - len(ids)
+                padded_ids = ids + [self.pad_token_id] * padding_length
+                attention_mask = [1] * len(ids) + [0] * padding_length
+                
+                padded_input_ids.append(padded_ids)
+                attention_masks.append(attention_mask)
+            
+            return {
+                'input_ids': torch.tensor(padded_input_ids, dtype=torch.long),
+                'attention_mask': torch.tensor(attention_masks, dtype=torch.long),
+                'labels': torch.tensor(padded_input_ids, dtype=torch.long)  # For causal LM
+            }
+    
+    # Choose appropriate data collator based on tokenizer type
+    if hasattr(tokenizer, 'encode') and hasattr(tokenizer, 'get_vocab_size'):
+        # Custom BPE tokenizer - use our custom data collator
+        data_collator = CustomDataCollator(pad_token_id=0)
+        print("Using custom data collator for BPE tokenizer")
+    else:
+        # Hugging Face tokenizer - use standard data collator
+        data_collator = DataCollatorForLanguageModeling(
+            tokenizer=tokenizer,
+            mlm=False,
+            pad_to_multiple_of=8
+        )
+        print("Using Hugging Face data collator")
+    
+    # Configure training arguments based on test mode
+    if test_mode:
+        training_args = TrainingArguments(
+            output_dir="./custom-gpt2-model",
+            overwrite_output_dir=True,
+            num_train_epochs=1,  # Quick training for testing
+            per_device_train_batch_size=2,
+            per_device_eval_batch_size=2,
+            gradient_accumulation_steps=2,
+            warmup_steps=50,
+            logging_steps=10,
+            save_steps=100,
+            eval_steps=100 if eval_dataset else None,
+            eval_strategy="steps" if eval_dataset else "no",
+            save_total_limit=1,
+            prediction_loss_only=True,
+            remove_unused_columns=False,
+            dataloader_pin_memory=False,
+            fp16=torch.cuda.is_available(),
+            gradient_checkpointing=False,  # Set to False initially for stability
+            optim="adamw_torch",
+            learning_rate=1e-3,
+            weight_decay=0.01,
+            adam_beta1=0.9,
+            adam_beta2=0.95,
+            max_grad_norm=1.0,
+            lr_scheduler_type="cosine",
+            report_to=[],  # Disable all external logging (wandb, tensorboard, etc.)
+            run_name=None,  # Explicitly set to None to avoid wandb confusion
+        )
+    else:
+        training_args = TrainingArguments(
+            output_dir="./custom-gpt2-model",
+            overwrite_output_dir=True,
+            num_train_epochs=3,
+            per_device_train_batch_size=4,
+            per_device_eval_batch_size=4,
+            gradient_accumulation_steps=4,
+            warmup_steps=500,
+            logging_steps=100,
+            save_steps=1000,
+            eval_steps=1000 if eval_dataset else None,
+            eval_strategy="steps" if eval_dataset else "no",
+            save_total_limit=2,
+            prediction_loss_only=True,
+            remove_unused_columns=False,
+            dataloader_pin_memory=False,
+            fp16=torch.cuda.is_available(),
+            gradient_checkpointing=False,  # Set to False initially for stability
+            optim="adamw_torch",
+            learning_rate=5e-4,
+            weight_decay=0.01,
+            adam_beta1=0.9,
+            adam_beta2=0.95,
+            max_grad_norm=1.0,
+            lr_scheduler_type="cosine",
+            report_to=[],  # Disable all external logging (wandb, tensorboard, etc.)
+            run_name=None,  # Explicitly set to None to avoid wandb confusion
+        )
+    
+    # Initialize custom trainer
+    trainer = CustomTrainer(
+        model=model,
+        args=training_args,
+        data_collator=data_collator,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+    )
+    
+    print("Starting training...")
+    trainer.train()
+    
+    # Save model and loss curves
+    trainer.save_model()
+    trainer.save_loss_curves()
+    trainer.plot_loss_curves()
+    
+    print("Training completed and model saved!")
+    
+    return trainer
 
 # ==================== EVALUATION FUNCTIONS ====================
 
@@ -693,8 +1114,12 @@ def compare_model_sizes(dataset, tokenizer, model_sizes=['tiny', 'small'], test_
     for size in model_sizes:
         print(f"\n--- Training {size.upper()} model ---")
         
-        # Create model
-        model, _ = create_custom_gpt2_model(model_size=size)
+        # Create model with custom tokenizer
+        model, custom_tokenizer = create_custom_gpt2_model(
+            model_size=size, 
+            use_custom_tokenizer=True, 
+            dataset=dataset
+        )
         model = model.to(device)
         
         # Get model info
@@ -730,14 +1155,37 @@ def compare_model_sizes(dataset, tokenizer, model_sizes=['tiny', 'small'], test_
         
         test_prompts = ["The future of AI", "Once upon a time", "Science shows that"]
         for prompt in test_prompts:
-            inputs = tokenizer.encode(prompt, return_tensors="pt").to(device)
-            outputs = model.generate(
-                inputs, max_length=30, temperature=0.8, do_sample=True, 
-                pad_token_id=tokenizer.pad_token_id
-            )
-            generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            generation_examples.append(f"'{prompt}' → '{generated}'")
-            print(f"  {generation_examples[-1]}")
+            try:
+                # Handle different tokenizer types
+                if hasattr(custom_tokenizer, 'encode') and hasattr(custom_tokenizer, 'get_vocab_size'):
+                    # Custom BPE tokenizer
+                    encoded = custom_tokenizer.encode(prompt)
+                    inputs = torch.tensor([encoded.ids], dtype=torch.long).to(device)
+                    pad_token_id = 0
+                else:
+                    # Hugging Face tokenizer
+                    inputs = custom_tokenizer.encode(prompt, return_tensors="pt").to(device)
+                    pad_token_id = custom_tokenizer.pad_token_id
+                
+                outputs = model.generate(
+                    inputs, max_length=30, temperature=0.8, do_sample=True, 
+                    pad_token_id=pad_token_id
+                )
+                
+                # Decode based on tokenizer type
+                if hasattr(custom_tokenizer, 'decode') and hasattr(custom_tokenizer, 'get_vocab_size'):
+                    # Custom BPE tokenizer
+                    generated = custom_tokenizer.decode(outputs[0].tolist())
+                else:
+                    # Hugging Face tokenizer
+                    generated = custom_tokenizer.decode(outputs[0], skip_special_tokens=True)
+                
+                generation_examples.append(f"'{prompt}' → '{generated}'")
+                print(f"  {generation_examples[-1]}")
+            except Exception as e:
+                error_msg = f"'{prompt}' → [Error: {str(e)}]"
+                generation_examples.append(error_msg)
+                print(f"  {error_msg}")
         
         # Store results
         comparison_results[size] = {
@@ -790,9 +1238,13 @@ def main_training_pipeline():
     print("\nLoading WikiText data...")
     dataset = load_wikitext_from_local_files(test_mode=TEST_MODE)
     
-    # Create custom model
-    print(f"\nCreating custom {recommended_size} model...")
-    model, tokenizer = create_custom_gpt2_model(model_size=recommended_size)
+    # Create custom model with BPE tokenizer as required
+    print(f"\nCreating custom {recommended_size} model with BPE tokenizer...")
+    model, tokenizer = create_custom_gpt2_model(
+        model_size=recommended_size, 
+        use_custom_tokenizer=True,  # Use BPE tokenizer as per requirements
+        dataset=dataset
+    )
     
     # Move to GPU
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -816,19 +1268,54 @@ def main_training_pipeline():
     print(f"\nPerforming comprehensive evaluation...")
     eval_results = evaluate_model_comprehensive(model, tokenized_dataset, tokenizer, "Custom GPT-2")
     
-    # Test generation
-    print(f"\nTesting text generation...")
+    # Analyze training progress from loss curves
+    print(f"\nAnalyzing training progress...")
+    training_analysis = analyze_training_progress("./loss_curves.json")
+    
+    # Evaluate different generation strategies
+    print(f"\nEvaluating text generation strategies...")
+    generation_results = evaluate_generation_strategies(
+        model=model, 
+        tokenizer=tokenizer, 
+        max_length=80,
+        device=device
+    )
+    
+    # Quick generation test
+    print(f"\nQuick generation examples...")
     model.eval()
     test_prompts = ["The", "Once upon", "Science"]
     
     for prompt in test_prompts:
-        inputs = tokenizer.encode(prompt, return_tensors="pt").to(device)
-        outputs = model.generate(
-            inputs, max_length=50, temperature=0.8, do_sample=True, 
-            pad_token_id=tokenizer.pad_token_id
-        )
-        generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        print(f"'{prompt}' → '{generated}'")
+        try:
+            # Handle different tokenizer types
+            if hasattr(tokenizer, 'encode') and hasattr(tokenizer, 'get_vocab_size'):
+                # Custom BPE tokenizer
+                encoded = tokenizer.encode(prompt)
+                inputs = torch.tensor([encoded.ids], dtype=torch.long).to(device)
+                pad_token_id = 0  # Use 0 for custom tokenizer
+            else:
+                # Hugging Face tokenizer
+                inputs = tokenizer.encode(prompt, return_tensors="pt").to(device)
+                pad_token_id = tokenizer.pad_token_id
+            
+            outputs = model.generate_with_strategies(
+                inputs, max_length=50, strategy='nucleus', top_p=0.9, temperature=0.8,
+                pad_token_id=pad_token_id
+            )
+            
+            # Decode the output
+            if hasattr(tokenizer, 'decode') and hasattr(tokenizer, 'get_vocab_size'):
+                # Custom BPE tokenizer
+                generated = tokenizer.decode(outputs[0].tolist())
+            else:
+                # Hugging Face tokenizer
+                generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            print(f"'{prompt}' → '{generated}'")
+        except Exception as e:
+            print(f"Error generating text for prompt '{prompt}': {e}")
+            continue
     
     print(f"\n" + "=" * 60)
     print("CUSTOM TRAINING COMPLETED!")
@@ -862,14 +1349,304 @@ def run_model_comparison():
     
     return comparison_results
 
+def evaluate_generation_strategies(model, tokenizer, prompts=None, max_length=100, device='cpu'):
+    """
+    Evaluate different text generation strategies and analyze fluency/diversity
+    
+    Args:
+        model: Trained model
+        tokenizer: Tokenizer
+        prompts: List of prompts to test (default uses standard prompts)
+        max_length: Maximum generation length
+        device: Device to run on
+    
+    Returns:
+        dict: Results for each strategy
+    """
+    if prompts is None:
+        prompts = [
+            "The future of artificial intelligence",
+            "Once upon a time in a distant galaxy",
+            "Climate change is affecting",
+            "The most important discovery in science",
+            "In the year 2050, technology will"
+        ]
+    
+    strategies = {
+        'greedy': {'strategy': 'greedy'},
+        'top_k_10': {'strategy': 'top_k', 'top_k': 10},
+        'top_k_50': {'strategy': 'top_k', 'top_k': 50},
+        'nucleus_0.7': {'strategy': 'nucleus', 'top_p': 0.7},
+        'nucleus_0.9': {'strategy': 'nucleus', 'top_p': 0.9},
+        'nucleus_0.95': {'strategy': 'nucleus', 'top_p': 0.95},
+        'random_low_temp': {'strategy': 'random', 'temperature': 0.5},
+        'random_high_temp': {'strategy': 'random', 'temperature': 1.5}
+    }
+    
+    print(f"\n{'='*80}")
+    print("TEXT GENERATION STRATEGY COMPARISON")
+    print(f"{'='*80}")
+    
+    results = {}
+    model.eval()
+    
+    for strategy_name, params in strategies.items():
+        print(f"\n--- {strategy_name.upper().replace('_', ' ')} ---")
+        strategy_results = {
+            'generations': [],
+            'unique_generations': set(),
+            'avg_length': 0,
+            'repetition_scores': []
+        }
+        
+        total_length = 0
+        
+        for i, prompt in enumerate(prompts):
+            print(f"\nPrompt {i+1}: '{prompt}'")
+            
+            # Generate multiple samples for diversity analysis
+            for sample in range(3):  # Generate 3 samples per prompt
+                try:
+                    # Handle different tokenizer types
+                    if hasattr(tokenizer, 'encode') and hasattr(tokenizer, 'get_vocab_size'):
+                        # Custom BPE tokenizer
+                        encoded = tokenizer.encode(prompt)
+                        inputs = torch.tensor([encoded.ids], dtype=torch.long).to(device)
+                        pad_token_id = 0
+                    else:
+                        # Hugging Face tokenizer
+                        inputs = tokenizer.encode(prompt, return_tensors="pt").to(device)
+                        pad_token_id = tokenizer.pad_token_id
+                    
+                    # Set default parameters
+                    generation_params = {
+                        'input_ids': inputs,
+                        'max_length': max_length,
+                        'temperature': params.get('temperature', 1.0),
+                        'strategy': params.get('strategy', 'greedy'),
+                        'top_k': params.get('top_k', 50),
+                        'top_p': params.get('top_p', 0.9),
+                        'pad_token_id': pad_token_id
+                    }
+                    
+                    outputs = model.generate_with_strategies(**generation_params)
+                    
+                    # Decode based on tokenizer type
+                    if hasattr(tokenizer, 'decode') and hasattr(tokenizer, 'get_vocab_size'):
+                        # Custom BPE tokenizer
+                        generated_text = tokenizer.decode(outputs[0].tolist())
+                    else:
+                        # Hugging Face tokenizer
+                        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                    
+                except Exception as e:
+                    print(f"  Error generating text: {e}")
+                    generated_text = f"[Error: {str(e)}]"
+                
+                # Calculate metrics
+                gen_length = len(generated_text.split())
+                total_length += gen_length
+                
+                # Check for repetition (simple metric: repeated trigrams)
+                words = generated_text.lower().split()
+                trigrams = [' '.join(words[i:i+3]) for i in range(len(words)-2)]
+                unique_trigrams = len(set(trigrams))
+                total_trigrams = len(trigrams)
+                repetition_score = 1 - (unique_trigrams / max(total_trigrams, 1))
+                
+                strategy_results['generations'].append(generated_text)
+                strategy_results['unique_generations'].add(generated_text)
+                strategy_results['repetition_scores'].append(repetition_score)
+                
+                if sample == 0:  # Show first sample
+                    print(f"  → {generated_text}")
+        
+        # Calculate averages
+        strategy_results['avg_length'] = total_length / len(strategy_results['generations'])
+        strategy_results['avg_repetition'] = sum(strategy_results['repetition_scores']) / len(strategy_results['repetition_scores'])
+        strategy_results['diversity_ratio'] = len(strategy_results['unique_generations']) / len(strategy_results['generations'])
+        
+        results[strategy_name] = strategy_results
+    
+    # Print comparison summary
+    print(f"\n{'='*80}")
+    print("STRATEGY COMPARISON SUMMARY")
+    print(f"{'='*80}")
+    print(f"{'Strategy':<15} {'Avg Length':<12} {'Diversity':<10} {'Repetition':<12} {'Quality Notes'}")
+    print("-" * 80)
+    
+    for strategy_name, result in results.items():
+        avg_len = f"{result['avg_length']:.1f}"
+        diversity = f"{result['diversity_ratio']:.2f}"
+        repetition = f"{result['avg_repetition']:.3f}"
+        
+        # Quality assessment
+        if strategy_name == 'greedy':
+            quality = "Deterministic, may repeat"
+        elif 'top_k_10' in strategy_name:
+            quality = "Conservative, coherent"
+        elif 'top_k_50' in strategy_name:
+            quality = "Balanced creativity"
+        elif 'nucleus_0.7' in strategy_name:
+            quality = "Focused, coherent"
+        elif 'nucleus_0.9' in strategy_name:
+            quality = "Good balance"
+        elif 'nucleus_0.95' in strategy_name:
+            quality = "More diverse"
+        elif 'low_temp' in strategy_name:
+            quality = "Conservative"
+        else:
+            quality = "Creative, may ramble"
+        
+        print(f"{strategy_name:<15} {avg_len:<12} {diversity:<10} {repetition:<12} {quality}")
+    
+    return results
+
+def analyze_generation_quality(generations, tokenizer):
+    """
+    Analyze quality metrics for generated text
+    
+    Args:
+        generations: List of generated texts
+        tokenizer: Tokenizer for analysis
+    
+    Returns:
+        dict: Quality metrics
+    """
+    metrics = {
+        'avg_length': 0,
+        'vocabulary_diversity': 0,
+        'repetition_penalty': 0,
+        'fluency_score': 0
+    }
+    
+    if not generations:
+        return metrics
+    
+    total_words = 0
+    all_words = []
+    total_repetition = 0
+    
+    for text in generations:
+        words = text.lower().split()
+        total_words += len(words)
+        all_words.extend(words)
+        
+        # Calculate repetition (consecutive word repetition)
+        repetitions = sum(1 for i in range(len(words)-1) if words[i] == words[i+1])
+        total_repetition += repetitions / max(len(words), 1)
+    
+    # Calculate metrics
+    metrics['avg_length'] = total_words / len(generations)
+    metrics['vocabulary_diversity'] = len(set(all_words)) / len(all_words) if all_words else 0
+    metrics['repetition_penalty'] = total_repetition / len(generations)
+    
+    # Simple fluency score (based on sentence structure)
+    fluency_scores = []
+    for text in generations:
+        sentences = text.split('.')
+        complete_sentences = sum(1 for s in sentences if len(s.strip().split()) >= 3)
+        fluency_scores.append(complete_sentences / max(len(sentences), 1))
+    
+    metrics['fluency_score'] = sum(fluency_scores) / len(fluency_scores)
+    
+    return metrics
+
+# ==================== EVALUATION FUNCTIONS ====================
+
+def run_generation_analysis():
+    """Run detailed analysis of text generation strategies"""
+    print("=" * 60)
+    print("TEXT GENERATION STRATEGY ANALYSIS")
+    print("=" * 60)
+    
+    # Load a pre-trained model (or train a simple one)
+    print("Setting up model for generation analysis...")
+    model, tokenizer = create_custom_gpt2_model(model_size="tiny")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    
+    # For demonstration, you might want to load a pre-trained model here
+    # or use a model that has been trained already
+    
+    print("Analyzing different generation strategies...")
+    generation_results = evaluate_generation_strategies(
+        model=model,
+        tokenizer=tokenizer,
+        prompts=[
+            "The future of AI",
+            "In a world where",
+            "Scientists discovered",
+            "The ancient mystery",
+            "Technology has changed"
+        ],
+        max_length=60,
+        device=device
+    )
+    
+    # Detailed analysis
+    print(f"\n{'='*60}")
+    print("DETAILED STRATEGY ANALYSIS")
+    print(f"{'='*60}")
+    
+    for strategy_name, results in generation_results.items():
+        print(f"\n{strategy_name.upper().replace('_', ' ')}:")
+        print(f"  Average Length: {results['avg_length']:.1f} words")
+        print(f"  Diversity Ratio: {results['diversity_ratio']:.2f}")
+        print(f"  Repetition Score: {results['avg_repetition']:.3f}")
+        
+        # Quality analysis
+        quality_metrics = analyze_generation_quality(results['generations'], tokenizer)
+        print(f"  Vocabulary Diversity: {quality_metrics['vocabulary_diversity']:.3f}")
+        print(f"  Fluency Score: {quality_metrics['fluency_score']:.3f}")
+    
+    return generation_results
+
+def run_loss_curve_analysis():
+    """Run analysis of existing loss curves (useful if you have saved training data)"""
+    print("=" * 60)
+    print("TRAINING LOSS CURVE ANALYSIS")
+    print("=" * 60)
+    
+    # Try to load and analyze existing loss curves
+    loss_file = "./loss_curves.json"
+    
+    if os.path.exists(loss_file):
+        print("Found existing loss curves data. Analyzing...")
+        
+        # Analyze training progress
+        analysis = analyze_training_progress(loss_file)
+        
+        # Plot the curves
+        plot_loss_curves_from_file(loss_file, save_path="./training_analysis.png", show_plot=False)
+        
+        print("\nLoss curve analysis completed!")
+        print("Files generated:")
+        print("  - training_analysis.png (loss curve plot)")
+        print("  - Detailed analysis printed above")
+        
+        return analysis
+    else:
+        print(f"No loss curves file found at {loss_file}")
+        print("Train a model first to generate loss curves.")
+        return None
+
 # ==================== RUN TRAINING ====================
 if __name__ == "__main__":
     # Choose what to run
     RUN_TRAINING = True
     RUN_MODEL_COMPARISON = False  # Set to True to compare model sizes
+    RUN_GENERATION_ANALYSIS = False  # Set to True to analyze generation strategies
+    RUN_LOSS_ANALYSIS = False  # Set to True to analyze existing loss curves
     
     if RUN_TRAINING:
         main_training_pipeline()
     
     if RUN_MODEL_COMPARISON:
         run_model_comparison()
+    
+    if RUN_GENERATION_ANALYSIS:
+        run_generation_analysis()
+    
+    if RUN_LOSS_ANALYSIS:
+        run_loss_curve_analysis()
