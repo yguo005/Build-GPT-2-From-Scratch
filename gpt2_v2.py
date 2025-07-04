@@ -30,7 +30,7 @@ import contextlib
 # 1. HYPERPARAMETERS (GPT-2 Standard Configurations)
 # =============================================================================
 
-# GPT-2 Small configuration
+# GPT-2 Small configuration, Model Architecture Only, define the neural network structure
 CONFIG = {
     'vocab_size': 50257,  # Will be set after tokenizer training
     'block_size': 128,    # Sequence length as required
@@ -41,7 +41,7 @@ CONFIG = {
     'bias': True
 }
 
-# Training hyperparameters
+# Training hyperparameters Only, define how to train the network
 TRAIN_CONFIG = {
     'batch_size': 8,      # Adjust based on GPU memory
     'gradient_accumulation_steps': 4,  # Simulate larger batch size
@@ -179,16 +179,17 @@ def prepare_data(texts, tokenizer, block_size):
     all_tokens = []
     
     print("Tokenizing texts...")
-    for text in tqdm(texts):
+    for text in tqdm(texts): # tqdm(texts):shows a progress bar during iteration
         tokens = tokenizer.encode(text)
-        all_tokens.extend(tokens)
+        all_tokens.extend(tokens) # extend: adds individual elements (not a nested list)
     
     # Chunk into sequences
     sequences = []
-    for i in range(0, len(all_tokens) - block_size, block_size):
-        sequences.append(all_tokens[i:i + block_size])
+    for i in range(0, len(all_tokens) - block_size, block_size): #Stop: len(all_tokens) - block_size (ensures we don't go past the end); Step: block_size (move by full sequence length each time)
+        sequences.append(all_tokens[i:i + block_size]) #Creates sequences of length 128
     
-    return torch.tensor(sequences, dtype=torch.long)
+    # Converts Python list to PyTorch tensor for training for GPU acceleration
+    return torch.tensor(sequences, dtype=torch.long) # Final shape: (num_sequences, block_size)
 
 # =============================================================================
 # 4. TRANSFORMER COMPONENTS (From reference with modifications)
@@ -202,33 +203,56 @@ class MultiHeadAttention(nn.Module):
         self.n_head = n_head
         self.n_embd = n_embd
         self.dropout = dropout
+        # block_size is NOT stored as instance variable: Only used once: Used only to create the causal mask buffer during initialization; Not needed later, Mask handles it: The actual sequence length is handled dynamically in forward()
         
+        # Better solution: Register buffer in the correct format (upper triangular boolean mask)
+        #self.register_buffer(
+           #'causal_mask',
+           #torch.triu(torch.ones(block_size, block_size), diagonal=1).bool())
+    
+
         # Use PyTorch's MultiheadAttention as specified in requirements
         self.attention = nn.MultiheadAttention(
             embed_dim=n_embd,
             num_heads=n_head,
             dropout=dropout,
-            bias=CONFIG['bias'],
-            batch_first=True
+            bias=CONFIG['bias'], # an additional parameter added to the output of a linear (fully connected) layer or projection. It allows the model to learn an offset in addition to the weighted sum of the inputs.
+            batch_first=True # Makes input/output shape (batch, seq, feature), 
         )
         
         # Causal mask for autoregressive generation
+        # Causal masking ensures that, during training or generation, each token can only attend to itself and previous tokens (not future tokens)
         self.register_buffer(
             'causal_mask',
             torch.tril(torch.ones(block_size, block_size)).view(1, block_size, block_size)
-        )
+        ) # torch.ones(block_size, block_size): Creates a square matrix of shape (block_size, block_size) filled with ones
+        # torch.tril(...): Converts the matrix to lower triangular form (all elements above the diagonal set to zero)
         
     def forward(self, x):
-        B, T, C = x.shape
-        
+        B, T, C = x.shape # batch size, time/sequence length(how many tokens in each sequence), channel/embedding dimension
+
         # Create causal attention mask
+        # this is inefficient since register_buffer was created before
         attn_mask = torch.triu(torch.ones(T, T), diagonal=1).bool().to(x.device)
-        
+
+        # instead, use the register_buffer, also refer to the register_buffer created in line 209:
+        #if T <= self.causal_mask.size(0): # Short Sequences (T ≤ buffer size)
+           #attn_mask = self.causal_mask[:T, :T] #Crops the pre-computed mask to match the current sequence length
+        #else:
+            # Fallback for sequences longer than buffer
+            #attn_mask = torch.triu(torch.ones(T, T), diagonal=1).bool().to(x.device)
+    
+
         # Apply attention
+
+        #This is called Self-Attention because:
+        #The input sequence (x) plays all three roles
+        #Each token attends to all other tokens in the same sequence
+        #This is the core mechanism in transformer models like GPT-2
         attn_output, _ = self.attention(
-            x, x, x,
+            x, x, x, # Query, Key, Value all the same in self-attention
             attn_mask=attn_mask,
-            need_weights=False
+            need_weights=False # Only compute weights in debug mode
         )
         
         return attn_output
@@ -239,9 +263,9 @@ class FeedForward(nn.Module):
     def __init__(self, n_embd, dropout=0.1):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd, bias=CONFIG['bias']),
+            nn.Linear(n_embd, 4 * n_embd, bias=CONFIG['bias']), # expand embedding dimension
             nn.GELU(),  # GELU instead of ReLU as required
-            nn.Linear(4 * n_embd, n_embd, bias=CONFIG['bias']),
+            nn.Linear(4 * n_embd, n_embd, bias=CONFIG['bias']), # Contraction back to original dimension
             nn.Dropout(dropout),
         )
 
@@ -716,7 +740,7 @@ def compare_model_sizes():
         config['vocab_size'] = tokenizer.tokenizer.get_vocab_size()
         
         # Prepare data
-        train_data = prepare_data(train_texts[:1000], tokenizer, config['block_size'])  # Use subset for faster comparison
+        train_data = prepare_data(train_texts[:500], tokenizer, config['block_size'])  # Use subset for faster comparison
         val_data = prepare_data(val_texts[:100], tokenizer, config['block_size'])
         test_data = prepare_data(test_texts[:100], tokenizer, config['block_size'])
         
